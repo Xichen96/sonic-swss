@@ -88,12 +88,17 @@ void RouteOrch::detach(Observer *observer, const IpAddress& dstAddr, sai_object_
 
 }
 
-bool RouteOrch::validnexthopinNextHopGroup(const NextHopKey &nexthop, uint32_t& count)
+bool RouteOrch::hasDefaultRouteNextHopGroup(const NextHopKey&) const
+{
+    return false;
+}
+
+bool RouteOrch::validnexthopinNextHopGroup(const NextHopKey &nexthop, uint32_t& count, bool mux_transition, bool local_ref)
 {
     return true;
 }
 
-bool RouteOrch::invalidnexthopinNextHopGroup(const NextHopKey &nexthop, uint32_t& count)
+bool RouteOrch::invalidnexthopinNextHopGroup(const NextHopKey &nexthop, uint32_t& count, bool mux_transition, bool local_ref)
 {
     return true;
 }
@@ -153,7 +158,7 @@ void RouteOrch::removeNextHopRoute(const NextHopKey& nextHop, const RouteKey& ro
 
 }
 
-bool RouteOrch::updateNextHopRoutes(const NextHopKey& nextHop, uint32_t& numRoutes)
+bool RouteOrch::updateNextHopRoutes(const NextHopKey& nextHop, uint32_t& numRoutes, bool mux_transition)
 {
     return true;
 }

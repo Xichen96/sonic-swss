@@ -827,7 +827,7 @@ private:
             return SAI_STATUS_SUCCESS;
         }
         size_t count = rs.size();
-        std::vector<sai_status_t> statuses(count);
+        std::vector<sai_status_t> statuses(count, SAI_STATUS_NOT_EXECUTED);
         sai_status_t status = (*remove_entries)((uint32_t)count, rs.data(), SAI_BULK_OP_ERROR_MODE_IGNORE_ERROR, statuses.data());
         if (status == SAI_STATUS_SUCCESS)
         {
@@ -864,7 +864,7 @@ private:
             return SAI_STATUS_SUCCESS;
         }
         size_t count = rs.size();
-        std::vector<sai_status_t> statuses(count);
+        std::vector<sai_status_t> statuses(count, SAI_STATUS_NOT_EXECUTED);
         sai_status_t status = (*create_entries)((uint32_t)count, rs.data(), cs.data(), tss.data()
             , SAI_BULK_OP_ERROR_MODE_IGNORE_ERROR, statuses.data());
         if (status == SAI_STATUS_SUCCESS)
@@ -904,7 +904,7 @@ private:
             return SAI_STATUS_SUCCESS;
         }
         size_t count = rs.size();
-        std::vector<sai_status_t> statuses(count);
+        std::vector<sai_status_t> statuses(count, SAI_STATUS_NOT_EXECUTED);
         sai_status_t status = (*set_entries_attribute)((uint32_t)count, rs.data(), ts.data()
             , SAI_BULK_OP_ERROR_MODE_IGNORE_ERROR, statuses.data());
         if (status == SAI_STATUS_SUCCESS)
@@ -1036,7 +1036,8 @@ public:
     sai_status_t create_entry(
         _Out_ sai_object_id_t *object_id,
         _In_ uint32_t attr_count,
-        _In_ const sai_attribute_t *attr_list)
+        _In_ const sai_attribute_t *attr_list,
+        _Out_ sai_status_t *object_status = nullptr)
     {
         assert(object_id);
         if (!object_id) throw std::invalid_argument("object_id is null");
@@ -1044,6 +1045,11 @@ public:
         if (!attr_list) throw std::invalid_argument("attr_list is null");
 
         creating_entries.emplace_back(std::piecewise_construct, std::forward_as_tuple(object_id), std::forward_as_tuple(attr_list, attr_list + attr_count));
+        if (object_status)
+        {
+            *object_status = SAI_STATUS_NOT_EXECUTED;
+            creating_status_pointers[object_id] = object_status;
+        }
 
         auto& last_attrs = std::get<1>(creating_entries.back());
         SWSS_LOG_INFO("ObjectBulker.create_entry %zu, %zu, %u\n", creating_entries.size(), last_attrs.size(), last_attrs[0].id);
@@ -1147,6 +1153,7 @@ public:
             flush_creating_entries(rs, tss, cs);
 
             creating_entries.clear();
+            creating_status_pointers.clear();
         }
 
         if (!setting_entries.empty())
@@ -1180,6 +1187,7 @@ public:
         removing_entries.clear();
         creating_entries.clear();
         setting_entries.clear();
+        creating_status_pointers.clear();
     }
 
     size_t creating_entries_count() const
@@ -1237,6 +1245,7 @@ private:
     sai_bulk_object_set_attribute_fn                        set_entries_attribute;
 
     std::unordered_map<sai_object_id_t, sai_status_t>       create_statuses;
+    std::unordered_map<sai_object_id_t *, sai_status_t *> creating_status_pointers;
 
     sai_status_t flush_removing_entries(
         _Inout_ std::vector<sai_object_id_t> &rs)
@@ -1246,7 +1255,7 @@ private:
             return SAI_STATUS_SUCCESS;
         }
         size_t count = rs.size();
-        std::vector<sai_status_t> statuses(count);
+        std::vector<sai_status_t> statuses(count, SAI_STATUS_NOT_EXECUTED);
         sai_status_t status = (*remove_entries)((uint32_t)count, rs.data(), SAI_BULK_OP_ERROR_MODE_STOP_ON_ERROR, statuses.data());
         if (status == SAI_STATUS_SUCCESS)
         {
@@ -1281,7 +1290,7 @@ private:
         }
         size_t count = rs.size();
         std::vector<sai_object_id_t> object_ids(count);
-        std::vector<sai_status_t> statuses(count);
+        std::vector<sai_status_t> statuses(count, SAI_STATUS_NOT_EXECUTED);
         sai_status_t status = (*create_entries)(switch_id, (uint32_t)count, cs.data(), tss.data()
             , SAI_BULK_OP_ERROR_MODE_STOP_ON_ERROR, object_ids.data(), statuses.data());
         if (status == SAI_STATUS_SUCCESS)
@@ -1299,6 +1308,11 @@ private:
             create_statuses.emplace(object_ids[i], statuses[i]);
             sai_object_id_t *pid = rs[i];
             *pid = (statuses[i] == SAI_STATUS_SUCCESS) ? object_ids[i] : SAI_NULL_OBJECT_ID;
+            auto result = creating_status_pointers.find(pid);
+            if (result != creating_status_pointers.end())
+            {
+                *result->second = statuses[i];
+            }
         }
 
         rs.clear();
@@ -1317,7 +1331,7 @@ private:
             return SAI_STATUS_SUCCESS;
         }
         size_t count = rs.size();
-        std::vector<sai_status_t> statuses(count);
+        std::vector<sai_status_t> statuses(count, SAI_STATUS_NOT_EXECUTED);
         sai_status_t status = (*set_entries_attribute)((uint32_t)count, rs.data(), ts.data(),
                                SAI_BULK_OP_ERROR_MODE_STOP_ON_ERROR, statuses.data());
         if (status == SAI_STATUS_SUCCESS)

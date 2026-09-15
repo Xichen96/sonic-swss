@@ -1,4 +1,5 @@
 #include <cassert>
+#include <algorithm>
 #include <string>
 #include <vector>
 #include <set>
@@ -489,8 +490,7 @@ bool MuxCable::stateInitActive()
         return false;
     }
 
-    refreshSliceRoute();
-    return true;
+    return refreshSliceRoute();
 }
 
 bool MuxCable::stateActive()
@@ -515,8 +515,7 @@ bool MuxCable::stateActive()
         return false;
     }
 
-    refreshSliceRoute();
-    return true;
+    return refreshSliceRoute();
 }
 
 bool MuxCable::stateStandby()
@@ -535,8 +534,6 @@ bool MuxCable::stateStandby()
         return false;
     }
 
-    refreshSliceRoute();
-
     if (!aclHandler(port.m_port_id, mux_name_))
     {
         SWSS_LOG_INFO("Add ACL drop rule failed for %s", mux_name_.c_str());
@@ -546,7 +543,7 @@ bool MuxCable::stateStandby()
     return true;
 }
 
-void MuxCable::setState(string new_state)
+bool MuxCable::setState(string new_state)
 {
     SWSS_LOG_NOTICE("[%s] Set MUX state from %s to %s", mux_name_.c_str(),
                      muxStateValToString.at(state_).c_str(), new_state.c_str());
@@ -555,6 +552,11 @@ void MuxCable::setState(string new_state)
 
     /* Update new_state to handle unknown state */
     new_state = muxStateValToString.at(ns);
+
+    if (st_chg_failed_)
+    {
+        return false;
+    }
 
     auto it = muxStateTransition.find(make_pair(state_, ns));
     if (it ==  muxStateTransition.end())
@@ -570,11 +572,18 @@ void MuxCable::setState(string new_state)
             SWSS_LOG_ERROR("State transition from %s to %s is not-handled ",
                             muxStateValToString.at(state_).c_str(), new_state.c_str());
         }
-        return;
+        return true;
+    }
+
+    if (!nbr_handler_->prepareStateChange(nbr_handler_type_ == MuxNbrHandlerType::NBR_HANDLER_PREFIX_BASED))
+    {
+        return false;
     }
 
     mux_cb_orch_->updateMuxMetricState(mux_name_, new_state, true);
 
+    slice_route_was_present_ = slice_route_nh_oid_ != SAI_NULL_OBJECT_ID;
+    acl_was_present_ = acl_handler_ != nullptr;
     prev_state_ = state_;
     state_ = ns;
 
@@ -596,7 +605,8 @@ void MuxCable::setState(string new_state)
     SWSS_LOG_INFO("Changed state to %s", new_state.c_str());
 
     mux_cb_orch_->updateMuxState(mux_name_, new_state);
-    return;
+    nbr_handler_->commitStateChange();
+    return true;
 }
 
 void MuxCable::rollbackStateChange()
@@ -617,26 +627,57 @@ void MuxCable::rollbackStateChange()
     nbr_handler_->clearBulkers();
     gNeighOrch->clearBulkers();
 
-    switch (prev_state_)
+    try
     {
-        case MuxState::MUX_STATE_ACTIVE:
-            success = stateActive();
-            break;
-        case MuxState::MUX_STATE_INIT:
-        case MuxState::MUX_STATE_STANDBY:
-            success = stateStandby();
-            break;
-        case MuxState::MUX_STATE_FAILED:
-        case MuxState::MUX_STATE_PENDING:
-            // Check at the start of the function means we will never reach here
-            SWSS_LOG_ERROR("[%s] Rollback to %s not supported", mux_name_.c_str(),
-                                muxStateValToString.at(prev_state_).c_str());
-            return;
+        auto tunnel_nh = mux_orch_->getNextHopTunnelId(MUX_TUNNEL, peer_ip4_);
+        success = true;
+        if (!slice_route_was_present_ && slice_route_nh_oid_ != SAI_NULL_OBJECT_ID)
+        {
+            auto status = remove_route(slice_ip6_);
+            success = status == SAI_STATUS_SUCCESS || status == SAI_STATUS_ITEM_NOT_FOUND;
+            if (success)
+            {
+                slice_route_nh_oid_ = SAI_NULL_OBJECT_ID;
+            }
+        }
+        else if (slice_route_was_present_ && prev_state_ != MuxState::MUX_STATE_ACTIVE)
+        {
+            success = refreshSliceRoute();
+        }
+        success = nbr_handler_->rollback(prev_state_ == MuxState::MUX_STATE_ACTIVE, tunnel_nh,
+                                        nbr_handler_type_ == MuxNbrHandlerType::NBR_HANDLER_PREFIX_BASED) && success;
+        success = updateRoutes() && success;
+        if (slice_route_was_present_ && prev_state_ == MuxState::MUX_STATE_ACTIVE)
+        {
+            success = refreshSliceRoute() && success;
+        }
+    }
+    catch (const std::exception& e)
+    {
+        SWSS_LOG_ERROR("[%s] Neighbor/route rollback interrupted: %s", mux_name_.c_str(), e.what());
+        success = false;
+    }
+
+    // ACL safety must not depend on successful neighbor compensation.
+    try
+    {
+        Port port;
+        if (!gPortsOrch->getPort(mux_name_, port) ||
+            !aclHandler(port.m_port_id, mux_name_, acl_was_present_))
+        {
+            success = false;
+        }
+    }
+    catch (const std::exception& e)
+    {
+        SWSS_LOG_ERROR("[%s] ACL rollback interrupted: %s", mux_name_.c_str(), e.what());
+        success = false;
     }
     st_chg_in_progress_ = false;
     if (success)
     {
         st_chg_failed_ = false;
+        nbr_handler_->commitStateChange();
     }
     else
     {
@@ -665,10 +706,17 @@ bool MuxCable::aclHandler(sai_object_id_t port, string alias, bool add)
     }
     if (add)
     {
-        acl_handler_ = make_shared<MuxAclHandler>(port, alias);
+        if (!acl_handler_)
+        {
+            acl_handler_ = make_shared<MuxAclHandler>(port, alias);
+        }
     }
     else
     {
+        if (acl_handler_ && !acl_handler_->remove())
+        {
+            return false;
+        }
         acl_handler_.reset();
     }
 
@@ -696,7 +744,7 @@ bool MuxCable::nbrHandler(bool enable, bool update_rt)
     {
         ret = nbr_handler_->enable(update_rt);
         // Loop through all routes with nexthops through this mux cable when changing state
-        updateRoutes();
+        ret = updateRoutes() && ret;
     }
     else
     {
@@ -707,7 +755,10 @@ bool MuxCable::nbrHandler(bool enable, bool update_rt)
             return false;
         }
         // Loop through all routes with nexthops through this mux cable when changing state
-        updateRoutes();
+        if (!updateRoutes() || !refreshSliceRoute())
+        {
+            return false;
+        }
         ret = nbr_handler_->disable(tnh);
     }
     return ret;
@@ -740,8 +791,9 @@ void MuxCable::updateNeighbor(NextHopKey nh, bool add)
 /**
  * @brief updates all routes pointing to the cables neighbor list
  */
-void MuxCable::updateRoutes()
+bool MuxCable::updateRoutes()
 {
+    bool ret = true;
     MuxNeighbor neighbors = nbr_handler_->getNeighbors();
     string alias = nbr_handler_->getAlias();
     for (auto nh = neighbors.begin(); nh != neighbors.end(); nh ++)
@@ -754,10 +806,11 @@ void MuxCable::updateRoutes()
             {
                 SWSS_LOG_NOTICE("Checking route %s for multi-mux nexthops",
                               rt->prefix.to_string().c_str());
-                mux_orch_->updateRoute(rt->prefix);
+                ret = mux_orch_->updateRoute(rt->prefix) && ret;
             }
         }
     }
+    return ret;
 }
 
 /**
@@ -778,22 +831,27 @@ void MuxCable::updateRoutesForNextHop(NextHopKey nh)
     }
 }
 
-void MuxCable::refreshSliceRoute()
+bool MuxCable::refreshSliceRoute()
 {
     if (!hasSlicePrefix())
     {
-        return;
+        return true;
     }
 
     IpPrefix slice_pfx = slice_ip6_;
     IpAddress anchor_ip = srv_ip6_.getIp();
     NextHopKey anchor_nh(anchor_ip, mux_name_);
     sai_object_id_t desired = nbr_handler_->getNextHopId(anchor_nh);
+    if (desired != SAI_NULL_OBJECT_ID && state_ == MuxState::MUX_STATE_STANDBY)
+    {
+        // Redirect before removing the anchor's local next hop.
+        desired = mux_orch_->getNextHopTunnelId(MUX_TUNNEL, peer_ip4_);
+    }
 
     // Anchor not resolved yet: keep any existing route; a later neighbor update re-drives this.
     if (desired == SAI_NULL_OBJECT_ID)
     {
-        return;
+        return true;
     }
 
     if (slice_route_nh_oid_ == SAI_NULL_OBJECT_ID)
@@ -804,13 +862,13 @@ void MuxCable::refreshSliceRoute()
             SWSS_LOG_ERROR("Mux %s: failed to install slice route %s nh 0x%" PRIx64 " rv %d",
                            mux_name_.c_str(), slice_pfx.to_string().c_str(),
                            desired, status);
-            return;
+            return false;
         }
         slice_route_nh_oid_ = desired;
         SWSS_LOG_NOTICE("Mux %s: installed slice route %s -> anchor nh 0x%" PRIx64,
                         mux_name_.c_str(), slice_pfx.to_string().c_str(), desired);
     }
-    else if (slice_route_nh_oid_ != desired)
+    else if (slice_route_nh_oid_ != desired || st_chg_in_progress_)
     {
         sai_status_t status = set_route(slice_pfx, desired);
         if (status != SAI_STATUS_SUCCESS)
@@ -818,13 +876,14 @@ void MuxCable::refreshSliceRoute()
             SWSS_LOG_ERROR("Mux %s: failed to update slice route %s nh 0x%" PRIx64 " rv %d",
                            mux_name_.c_str(), slice_pfx.to_string().c_str(),
                            desired, status);
-            return;
+            return false;
         }
         SWSS_LOG_NOTICE("Mux %s: slice route %s nh 0x%" PRIx64 " -> 0x%" PRIx64,
                         mux_name_.c_str(), slice_pfx.to_string().c_str(),
                         slice_route_nh_oid_, desired);
         slice_route_nh_oid_ = desired;
     }
+    return true;
 }
 
 void MuxNbrHandler::update(NextHopKey nh, sai_object_id_t tunnelId, bool add, MuxState state)
@@ -885,10 +944,216 @@ void MuxNbrHandler::update(NextHopKey nh, sai_object_id_t tunnelId, bool add, Mu
     }
 }
 
+bool MuxNbrHandler::prepareStateChange(bool require_local_nh)
+{
+    std::map<IpAddress, NeighborProgress> progress;
+    const auto& table = gNeighOrch->getNeighborTable();
+    for (const auto& neighbor : neighbors_)
+    {
+        NextHopKey key(neighbor.first, alias_);
+        auto member = table.find(key);
+        auto local_nh = gNeighOrch->getLocalNextHopId(key);
+        if (member == table.end() || !member->second.mac ||
+            (require_local_nh && local_nh == SAI_NULL_OBJECT_ID))
+        {
+            SWSS_LOG_INFO("Deferring MUX transition: neighbor %s is not available", key.to_string().c_str());
+            return false;
+        }
+        int refs = local_nh == SAI_NULL_OBJECT_ID ? 0 : gNeighOrch->getNextHopRefCount(key);
+        auto inserted = progress.emplace(neighbor.first, NeighborProgress{neighbor.second, refs});
+        inserted.first->second.members_local = neighbor.second != SAI_NULL_OBJECT_ID &&
+                                              neighbor.second == local_nh;
+    }
+    transition_ = std::move(progress);
+    neighbor_contexts_.clear();
+    return true;
+}
+
+void MuxNbrHandler::commitStateChange()
+{
+    transition_.clear();
+    neighbor_contexts_.clear();
+}
+
+void MuxNbrHandler::startRouteUpdate(const IpAddress& ip, bool host_route)
+{
+    auto progress = transition_.find(ip);
+    if (progress != transition_.end())
+    {
+        if (host_route)
+        {
+            progress->second.host_route_started = true;
+        }
+        else
+        {
+            progress->second.routes_started = true;
+        }
+    }
+}
+
+bool MuxNbrHandler::updateNeighborRoutes(const NextHopKey& nh, bool active, bool prefix_based, bool restoring)
+{
+    uint32_t count = 0;
+    auto progress = transition_.find(nh.ip_address);
+    auto execute = [&](const char* operation, auto&& callback) {
+        try
+        {
+            return callback();
+        }
+        catch (const std::exception& e)
+        {
+            SWSS_LOG_ERROR("MUX %s interrupted for %s: %s", operation, nh.to_string().c_str(), e.what());
+            if (progress != transition_.end())
+                progress->second.route_result_unknown = true;
+            return false;
+        }
+    };
+    bool ret = execute("route update", [&] { return gRouteOrch->updateNextHopRoutes(nh, count, true); });
+    uint32_t route_delta = count;
+    if (progress != transition_.end())
+    {
+        if (restoring)
+        {
+            // RouteOrch processes a stable ordered prefix; do not count an already restored prefix twice.
+            auto restored = std::min(count, progress->second.routes_changed);
+            route_delta = restored > progress->second.routes_restored
+                        ? restored - progress->second.routes_restored : 0;
+            progress->second.routes_restored = std::max(restored, progress->second.routes_restored);
+        }
+        else
+        {
+            progress->second.routes_changed = count;
+        }
+    }
+    if (route_delta && active)
+        gNeighOrch->increaseNextHopRefCount(nh, route_delta);
+    else if (route_delta)
+        gNeighOrch->decreaseNextHopRefCount(nh, route_delta);
+    if (!ret)
+    {
+        return false;
+    }
+    if (restoring && gRouteOrch->hasDefaultRouteNextHopGroup(nh))
+    {
+        // Generic default-route substitution has separate ownership and cannot be undone by member replay.
+        SWSS_LOG_ERROR("MUX recovery needs default-route NHG reconciliation for %s", nh.to_string().c_str());
+        return false;
+    }
+    bool members_local = progress == transition_.end() ? !active : progress->second.members_local;
+    ret = execute("ECMP removal", [&] { return gRouteOrch->invalidnexthopinNextHopGroup(nh, count, true, members_local); });
+    if (members_local && count)
+    {
+        gNeighOrch->decreaseNextHopRefCount(nh, count);
+    }
+    if (!ret)
+    {
+        return false;
+    }
+    if (progress != transition_.end())
+        progress->second.members_local = active;
+    if (active || !prefix_based)
+    {
+        ret = execute("ECMP addition", [&] { return gRouteOrch->validnexthopinNextHopGroup(nh, count, true, active); });
+        if (active && count)
+        {
+            gNeighOrch->increaseNextHopRefCount(nh, count);
+        }
+    }
+    return ret;
+}
+
+bool MuxNbrHandler::rollback(bool active, sai_object_id_t tunnel_nh, bool prefix_based)
+{
+    bool ret = true;
+    std::set<IpAddress> blocked_cleanup;
+    if (active)
+    {
+        ret = gNeighOrch->restoreNeighbors(neighbor_contexts_, true);
+    }
+    for (auto& entry : transition_)
+    {
+        auto& progress = entry.second;
+        if (!progress.routes_started && !progress.host_route_started)
+        {
+            continue;
+        }
+        NextHopKey key(entry.first, alias_);
+        try
+        {
+            auto target = active ? gNeighOrch->getLocalNextHopId(key) : progress.nexthop;
+            if (!active && target == SAI_NULL_OBJECT_ID)
+            {
+                target = tunnel_nh;
+            }
+            if (target == SAI_NULL_OBJECT_ID)
+            {
+                blocked_cleanup.insert(entry.first);
+                ret = false;
+                continue;
+            }
+            neighbors_.at(entry.first) = target;
+            bool restored = !progress.routes_started || updateNeighborRoutes(key, active, prefix_based, true);
+            if (restored && gNeighOrch->getLocalNextHopId(key) != SAI_NULL_OBJECT_ID)
+            {
+                auto current = gNeighOrch->getNextHopRefCount(key);
+                if (current != progress.ref_count)
+                {
+                    SWSS_LOG_ERROR("MUX recovery reference mismatch for %s: expected %d, got %d",
+                                   key.to_string().c_str(), progress.ref_count, current);
+                    restored = false;
+                }
+            }
+            if (progress.host_route_started)
+            {
+                std::list<MuxRouteBulkContext> routes{MuxRouteBulkContext(IpPrefix(entry.first.to_string()), target)};
+                bool host_restored = true;
+                if (prefix_based)
+                    host_restored = setBulkRouteNH(routes);
+                else if (active && progress.host_route_created)
+                    host_restored = removeRoutes(routes);
+                else if (!active && (progress.host_route_removed || progress.host_route_unknown))
+                    host_restored = addRoutes(routes);
+                if (progress.host_route_unknown)
+                    host_restored = false;
+                updateTunnelRoute(key, !active);
+                restored = host_restored && restored;
+            }
+            restored = !progress.route_result_unknown && restored;
+            if (!restored)
+            {
+                blocked_cleanup.insert(entry.first);
+                ret = false;
+            }
+        }
+        catch (const std::exception& e)
+        {
+            SWSS_LOG_ERROR("MUX route rollback interrupted for %s: %s", key.to_string().c_str(), e.what());
+            blocked_cleanup.insert(entry.first);
+            ret = false;
+        }
+    }
+    if (!active)
+    {
+        for (auto& ctx : neighbor_contexts_)
+        {
+            if (blocked_cleanup.count(ctx.neighborEntry.ip_address))
+            {
+                ret = false;
+                continue;
+            }
+            std::list<NeighborContext> restore{ctx};
+            ret = gNeighOrch->restoreNeighbors(restore, false) && ret;
+            ctx = restore.front();
+        }
+    }
+    return ret;
+}
+
 bool MuxNbrHandler::enable(bool update_rt)
 {
     NeighborEntry neigh;
-    std::list<NeighborContext> neigh_ctx_list;
+    auto& neigh_ctx_list = neighbor_contexts_;
+    neigh_ctx_list.clear();
     std::list<MuxRouteBulkContext> route_ctx_list;
 
     auto it = neighbors_.begin();
@@ -921,41 +1186,19 @@ bool MuxNbrHandler::enable(bool update_rt)
         }
 
         it->second = local_nh;
+        startRouteUpdate(it->first);
 
         /* Reprogram route */
-        uint32_t num_routes = 0;
-        if (!gRouteOrch->updateNextHopRoutes(nh_key, num_routes))
+        if (!updateNeighborRoutes(nh_key, true, false))
         {
             SWSS_LOG_INFO("Update route failed for NH %s", nh_key.ip_address.to_string().c_str());
             return false;
         }
 
-        /* Increment ref count for new NHs */
-        gNeighOrch->increaseNextHopRefCount(nh_key, num_routes);
-
-        /*
-         * Invalidate current nexthop group and update with new NH
-         * Ref count update is not required for tunnel NH IDs (nh_removed)
-         */
-        uint32_t nh_removed, nh_added;
-        if (!gRouteOrch->invalidnexthopinNextHopGroup(nh_key, nh_removed))
-        {
-            SWSS_LOG_ERROR("Removing existing NH failed for %s", nh_key.ip_address.to_string().c_str());
-            return false;
-        }
-
-        if (!gRouteOrch->validnexthopinNextHopGroup(nh_key, nh_added))
-        {
-            SWSS_LOG_ERROR("Adding NH failed for %s", nh_key.ip_address.to_string().c_str());
-            return false;
-        }
-
-        /* Increment ref count for ECMP NH members */
-        gNeighOrch->increaseNextHopRefCount(nh_key, nh_added);
-
         IpPrefix pfx = it->first.to_string();
         if (update_rt)
         {
+            startRouteUpdate(it->first, true);
             route_ctx_list.push_back(MuxRouteBulkContext(pfx));
             updateTunnelRoute(nh_key, false);
         }
@@ -974,7 +1217,8 @@ bool MuxNbrHandler::enable(bool update_rt)
 bool MuxNbrHandler::disable(sai_object_id_t tnh)
 {
     NeighborEntry neigh;
-    std::list<NeighborContext> neigh_ctx_list;
+    auto& neigh_ctx_list = neighbor_contexts_;
+    neigh_ctx_list.clear();
     std::list<MuxRouteBulkContext> route_ctx_list;
     bool ret = true;
 
@@ -986,6 +1230,17 @@ bool MuxNbrHandler::disable(sai_object_id_t tnh)
         neigh = NeighborEntry(it->first, alias_);
         NextHopKey nh_key = NextHopKey(it->first, alias_);
         sai_object_id_t local_nh = gNeighOrch->getLocalNextHopId(nh_key);
+        if (gNeighOrch->getNeighborTable().find(neigh) == gNeighOrch->getNeighborTable().end())
+        {
+            ret = false;
+            it++;
+            continue;
+        }
+        if (!gNeighOrch->isHwConfigured(neigh) && local_nh == SAI_NULL_OBJECT_ID && it->second == tnh)
+        {
+            it++;
+            continue;
+        }
         if (!gNeighOrch->isHwConfigured(neigh) || local_nh == SAI_NULL_OBJECT_ID)
         {
             SWSS_LOG_INFO("Neighbor %s on %s is not available for disable",
@@ -997,35 +1252,16 @@ bool MuxNbrHandler::disable(sai_object_id_t tnh)
 
         /* Update NH to point to Tunnel nexhtop */
         it->second = tnh;
+        startRouteUpdate(it->first);
 
         /* Reprogram route */
-        uint32_t num_routes = 0;
-        if (!gRouteOrch->updateNextHopRoutes(nh_key, num_routes))
+        if (!updateNeighborRoutes(nh_key, false, false))
         {
             SWSS_LOG_INFO("Update route failed for NH %s", nh_key.ip_address.to_string().c_str());
             return false;
         }
 
-        /* Decrement ref count for old NHs */
-        gNeighOrch->decreaseNextHopRefCount(nh_key, num_routes);
-
-        /* Invalidate current nexthop group and update with new NH */
-        uint32_t nh_removed, nh_added;
-        if (!gRouteOrch->invalidnexthopinNextHopGroup(nh_key, nh_removed))
-        {
-            SWSS_LOG_ERROR("Removing existing NH failed for %s", nh_key.ip_address.to_string().c_str());
-            return false;
-        }
-
-        /* Decrement ref count for ECMP NH members */
-        gNeighOrch->decreaseNextHopRefCount(nh_key, nh_removed);
-
-        if (!gRouteOrch->validnexthopinNextHopGroup(nh_key, nh_added))
-        {
-            SWSS_LOG_ERROR("Adding NH failed for %s", nh_key.ip_address.to_string().c_str());
-            return false;
-        }
-
+        startRouteUpdate(it->first, true);
         updateTunnelRoute(nh_key, true);
 
         IpPrefix pfx = it->first.to_string();
@@ -1077,7 +1313,7 @@ bool MuxNbrHandler::addRoutes(std::list<MuxRouteBulkContext>& bulk_ctx_list)
 
         SWSS_LOG_INFO("Adding route entry %s, nh %" PRIx64 " to bulker", ctx->pfx.getIp().to_string().c_str(), ctx->nh);
 
-        object_statuses.emplace_back();
+        object_statuses.emplace_back(SAI_STATUS_NOT_EXECUTED);
         sai_attribute_t attr;
         vector<sai_attribute_t> attrs;
 
@@ -1092,7 +1328,21 @@ bool MuxNbrHandler::addRoutes(std::list<MuxRouteBulkContext>& bulk_ctx_list)
         status = gRouteBulker.create_entry(&object_statuses.back(), &route_entry, (uint32_t)attrs.size(), attrs.data());
     }
 
-    gRouteBulker.flush();
+    try
+    {
+        gRouteBulker.flush();
+    }
+    catch (const std::exception& e)
+    {
+        SWSS_LOG_ERROR("MUX host route create interrupted: %s", e.what());
+        ret = false;
+        for (const auto& ctx : bulk_ctx_list)
+        {
+            auto progress = transition_.find(ctx.pfx.getIp());
+            if (progress != transition_.end() && ctx.object_statuses.front() == SAI_STATUS_NOT_EXECUTED)
+                progress->second.host_route_unknown = true;
+        }
+    }
 
     for (auto ctx = bulk_ctx_list.begin(); ctx != bulk_ctx_list.end(); ctx++)
     {
@@ -1127,6 +1377,9 @@ bool MuxNbrHandler::addRoutes(std::list<MuxRouteBulkContext>& bulk_ctx_list)
             gCrmOrch->incCrmResUsedCounter(CrmResourceType::CRM_IPV6_ROUTE);
         }
 
+        auto progress = transition_.find(ctx->pfx.getIp());
+        if (progress != transition_.end())
+            progress->second.host_route_created = true;
         SWSS_LOG_NOTICE("Created tunnel route to %s ", ctx->pfx.to_string().c_str());
     }
 
@@ -1150,11 +1403,25 @@ bool MuxNbrHandler::removeRoutes(std::list<MuxRouteBulkContext>& bulk_ctx_list)
 
         SWSS_LOG_INFO("Removing route entry %s, nh %" PRIx64 "", ctx->pfx.getIp().to_string().c_str(), ctx->nh);
 
-        object_statuses.emplace_back();
+        object_statuses.emplace_back(SAI_STATUS_NOT_EXECUTED);
         status = gRouteBulker.remove_entry(&object_statuses.back(), &route_entry);
     }
 
-    gRouteBulker.flush();
+    try
+    {
+        gRouteBulker.flush();
+    }
+    catch (const std::exception& e)
+    {
+        SWSS_LOG_ERROR("MUX host route remove interrupted: %s", e.what());
+        ret = false;
+        for (const auto& ctx : bulk_ctx_list)
+        {
+            auto progress = transition_.find(ctx.pfx.getIp());
+            if (progress != transition_.end() && ctx.object_statuses.front() == SAI_STATUS_NOT_EXECUTED)
+                progress->second.host_route_unknown = true;
+        }
+    }
 
     for (auto ctx = bulk_ctx_list.begin(); ctx != bulk_ctx_list.end(); ctx++)
     {
@@ -1189,6 +1456,9 @@ bool MuxNbrHandler::removeRoutes(std::list<MuxRouteBulkContext>& bulk_ctx_list)
             gCrmOrch->decCrmResUsedCounter(CrmResourceType::CRM_IPV6_ROUTE);
         }
 
+        auto progress = transition_.find(ctx->pfx.getIp());
+        if (progress != transition_.end())
+            progress->second.host_route_removed = true;
         SWSS_LOG_NOTICE("Removed tunnel route to %s ", ctx->pfx.to_string().c_str());
     }
 
@@ -1240,7 +1510,7 @@ bool MuxNbrHandler::setBulkRouteNH(std::list<MuxRouteBulkContext>& bulk_ctx_list
 
         SWSS_LOG_INFO("Setting route entry %s, nh %" PRIx64 " to bulker", ctx->pfx.getIp().to_string().c_str(), ctx->nh);
 
-        object_statuses.emplace_back();
+        object_statuses.emplace_back(SAI_STATUS_NOT_EXECUTED);
         sai_attribute_t route_attr;
 
         route_attr.id = SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID;
@@ -1259,11 +1529,6 @@ bool MuxNbrHandler::setBulkRouteNH(std::list<MuxRouteBulkContext>& bulk_ctx_list
 
         if (status != SAI_STATUS_SUCCESS)
         {
-            if (status == SAI_STATUS_ITEM_ALREADY_EXISTS) {
-                SWSS_LOG_INFO("Route %s with NH %" PRIx64 " already exists",
-                        ctx->pfx.to_string().c_str(), ctx->nh);
-                continue;
-            }
             SWSS_LOG_ERROR("Failed to set route %s,nh %" PRIx64 " rv:%d",
                     ctx->pfx.getIp().to_string().c_str(), ctx->nh, status);
             ret = false;
@@ -1363,7 +1628,13 @@ bool MuxPrefixBasedNbrHandler::enable(bool update_rt)
     while (it != neighbors_.end())
     {
         neigh = NeighborEntry(it->first, alias_);
-        it->second = gNeighOrch->getLocalNextHopId(neigh);
+        auto local_nh = gNeighOrch->getLocalNextHopId(neigh);
+        if (local_nh == SAI_NULL_OBJECT_ID)
+        {
+            return false;
+        }
+        it->second = local_nh;
+        startRouteUpdate(it->first, true);
         /* Reprogram route */
         NextHopKey nh_key = NextHopKey(it->first, alias_);
 
@@ -1391,31 +1662,12 @@ bool MuxPrefixBasedNbrHandler::enable(bool update_rt)
         /* Reprogram route */
         NextHopKey nh_key = NextHopKey(it->first, alias_);
 
-        uint32_t num_routes = 0;
-        if (!gRouteOrch->updateNextHopRoutes(nh_key, num_routes))
+        startRouteUpdate(it->first);
+        if (!updateNeighborRoutes(nh_key, true, true))
         {
             SWSS_LOG_INFO("Update route failed for NH %s", nh_key.ip_address.to_string().c_str());
             return false;
         }
-        SWSS_LOG_INFO("Update route for NH %s num_route: %u", nh_key.ip_address.to_string().c_str(), num_routes);
-
-        /* Increment ref count for new NHs */
-        gNeighOrch->increaseNextHopRefCount(nh_key, num_routes);
-
-        uint32_t nh_added;
-        // We do not need to remove tunnel nh as it was not added in the ECMP group.
-        // Just add the active nbr nh.
-
-        if (!gRouteOrch->validnexthopinNextHopGroup(nh_key, nh_added))
-        {
-            SWSS_LOG_ERROR("Adding NH failed for %s", nh_key.ip_address.to_string().c_str());
-            return false;
-        }
-        SWSS_LOG_INFO("Adding NH for %s, nh_added: %u", nh_key.ip_address.to_string().c_str(), nh_added);
-
-        /* Increment ref count for ECMP NH members */
-        gNeighOrch->increaseNextHopRefCount(nh_key, nh_added);
-
         if (update_rt)
         {
             updateTunnelRoute(nh_key, false);
@@ -1437,6 +1689,7 @@ bool MuxPrefixBasedNbrHandler::disable(sai_object_id_t tnh)
     {
         /* Update NH to point to Tunnel nexthop */
         it->second = tnh;
+        startRouteUpdate(it->first, true);
 
         /* Set the neighbor prefix route to tunnel nexthop */
         NextHopKey nh_key = NextHopKey(it->first, alias_);
@@ -1457,30 +1710,12 @@ bool MuxPrefixBasedNbrHandler::disable(sai_object_id_t tnh)
     while (it != neighbors_.end())
     {
         NextHopKey nh_key = NextHopKey(it->first, alias_);
-        uint32_t num_routes = 0;
-
-        if (!gRouteOrch->updateNextHopRoutes(nh_key, num_routes))
+        startRouteUpdate(it->first);
+        if (!updateNeighborRoutes(nh_key, false, true))
         {
             SWSS_LOG_INFO("Update route failed for NH %s", nh_key.ip_address.to_string().c_str());
             return false;
         }
-        SWSS_LOG_INFO("Update route for NH %s, num_routes: %u", nh_key.ip_address.to_string().c_str(), num_routes);
-
-        /* Decrement ref count for old NHs */
-        gNeighOrch->decreaseNextHopRefCount(nh_key, num_routes);
-
-        /* Invalidate current nexthop group by removing the neighbor NH */
-        uint32_t nh_removed;
-        if (!gRouteOrch->invalidnexthopinNextHopGroup(nh_key, nh_removed))
-        {
-            SWSS_LOG_ERROR("Removing existing NH failed for %s", nh_key.ip_address.to_string().c_str());
-            return false;
-        }
-        SWSS_LOG_INFO("Removing existing NH for %s, nh_removed: %u", nh_key.ip_address.to_string().c_str(), nh_removed);
-
-        /* Decrement ref count for ECMP NH members */
-        gNeighOrch->decreaseNextHopRefCount(nh_key, nh_removed);
-
         updateTunnelRoute(nh_key, true);
 
         it++;
@@ -1516,17 +1751,41 @@ MuxAclHandler::MuxAclHandler(sai_object_id_t port, string alias)
     {
         shared_ptr<AclRulePacket> newRule =
                 make_shared<AclRulePacket>(gAclOrch, rule_name, table_name, false /*no counters*/);
-        createMuxAclRule(newRule, table_name);
+        if (!createMuxAclRule(newRule, table_name))
+        {
+            SWSS_LOG_THROW("Failed to create MUX ACL rule for %s", alias.c_str());
+        }
     }
     else
     {
-        gAclOrch->updateAclRule(table_name, rule_name, MATCH_IN_PORTS, &port, RULE_OPER_ADD);
+        if (!gAclOrch->updateAclRule(table_name, rule_name, MATCH_IN_PORTS, &port, RULE_OPER_ADD))
+        {
+            SWSS_LOG_THROW("Failed to bind MUX ACL rule for %s", alias.c_str());
+        }
     }
+    bound_ = true;
 }
 
 MuxAclHandler::~MuxAclHandler(void)
 {
+    try
+    {
+        if (!remove())
+            SWSS_LOG_ERROR("Failed to remove MUX ACL binding for %s", alias_.c_str());
+    }
+    catch (const std::exception& e)
+    {
+        SWSS_LOG_ERROR("MUX ACL destruction failed for %s: %s", alias_.c_str(), e.what());
+    }
+}
+
+bool MuxAclHandler::remove()
+{
     SWSS_LOG_ENTER();
+    if (!bound_)
+    {
+        return true;
+    }
     string table_name = is_ingress_acl_ ? MUX_ACL_TABLE_NAME : EGRESS_TABLE_DROP;
     string rule_name = MUX_ACL_RULE_NAME;
 
@@ -1535,18 +1794,23 @@ MuxAclHandler::~MuxAclHandler(void)
     AclRule* rule = gAclOrch->getAclRule(table_name, rule_name);
     if (rule == nullptr)
     {
-        SWSS_LOG_THROW("ACL Rule does not exist for port %s, rule %s", alias_.c_str(), rule_name.c_str());
+        bound_ = false;
+        return true;
     }
 
     vector<sai_object_id_t> port_set = rule->getInPorts();
+    bool ret;
     if ((port_set.size() == 1) && (port_set[0] == port_))
     {
-        gAclOrch->removeAclRule(table_name, rule_name);
+        ret = gAclOrch->removeAclRule(table_name, rule_name);
     }
     else
     {
-        gAclOrch->updateAclRule(table_name, rule_name, MATCH_IN_PORTS, &port_, RULE_OPER_DELETE);
+        ret = gAclOrch->updateAclRule(table_name, rule_name, MATCH_IN_PORTS, &port_, RULE_OPER_DELETE);
     }
+    if (ret)
+        bound_ = false;
+    return ret;
 }
 
 void MuxAclHandler::createMuxAclTable(sai_object_id_t port, string strTable)
@@ -1571,7 +1835,7 @@ void MuxAclHandler::createMuxAclTable(sai_object_id_t port, string strTable)
     bindAllPorts(acl_table);
 }
 
-void MuxAclHandler::createMuxAclRule(shared_ptr<AclRulePacket> rule, string strTable)
+bool MuxAclHandler::createMuxAclRule(shared_ptr<AclRulePacket> rule, string strTable)
 {
     SWSS_LOG_ENTER();
 
@@ -1590,7 +1854,7 @@ void MuxAclHandler::createMuxAclRule(shared_ptr<AclRulePacket> rule, string strT
     attr_value = PACKET_ACTION_DROP;
     rule->validateAddAction(attr_name, attr_value);
 
-    gAclOrch->addAclRule(rule, strTable);
+    return gAclOrch->addAclRule(rule, strTable);
 }
 
 void MuxAclHandler::bindAllPorts(AclTable &acl_table)
@@ -1692,7 +1956,7 @@ sai_object_id_t MuxOrch::getTunnelNextHopId()
  * @brief updates the given route to point to a single active NH or tunnel
  * @param pfx IpPrefix of route to update
  */
-void MuxOrch::updateRoute(const IpPrefix &pfx)
+bool MuxOrch::updateRoute(const IpPrefix &pfx)
 {
     NextHopGroupKey nhg_key;
     NextHopGroupEntry nhg_entry;
@@ -1706,7 +1970,7 @@ void MuxOrch::updateRoute(const IpPrefix &pfx)
     if (nhg_key.getSize() <= 1)
     {
         SWSS_LOG_INFO("Route points to single nexthop, ignoring");
-        return;
+        return true;
     }
 
     std::set<NextHopKey> nextHops;
@@ -1741,6 +2005,10 @@ void MuxOrch::updateRoute(const IpPrefix &pfx)
              * only that neighbor's nexthop ID is added, and not the tunnel nexthop
              */
             next_hop_id = gNeighOrch->getLocalNextHopId(nexthop);
+            if (next_hop_id == SAI_NULL_OBJECT_ID)
+            {
+                continue;
+            }
             /* set route entry to point to nh */
             status = set_route(pfx, next_hop_id);
             if (status != SAI_STATUS_SUCCESS)
@@ -1767,8 +2035,10 @@ void MuxOrch::updateRoute(const IpPrefix &pfx)
         {
             SWSS_LOG_ERROR("Failed to set route entry %s to tunnel",
                     pfx.getIp().to_string().c_str());
+            return false;
         }
     }
+    return true;
 }
 
 MuxCable* MuxOrch::findMuxCableInSubnet(IpAddress ip)
@@ -2973,27 +3243,34 @@ bool MuxCableOrch::addOperation(const Request& request)
 
     try
     {
-        mux_obj->setState(state);
+        if (!mux_obj->setState(state))
+        {
+            // No transition started. Retain the request for a later orchestration cycle.
+            return false;
+        }
     }
     catch(const std::runtime_error& e)
     {
         SWSS_LOG_ERROR("Mux Error setting state %s for port %s. Error: %s",
                         state.c_str(), port_name.c_str(), e.what());
-        mux_obj->rollbackStateChange();
+        if (mux_obj->isStateChangeInProgress() || mux_obj->isStateChangeFailed())
+            mux_obj->rollbackStateChange();
         return true;
     }
     catch (const std::logic_error& e)
     {
         SWSS_LOG_ERROR("Logic error while setting state %s for port %s. Error: %s",
                         state.c_str(), port_name.c_str(), e.what());
-        mux_obj->rollbackStateChange();
+        if (mux_obj->isStateChangeInProgress() || mux_obj->isStateChangeFailed())
+            mux_obj->rollbackStateChange();
         return true;
     }
     catch (const std::exception& e)
     {
         SWSS_LOG_ERROR("Exception caught while setting state %s for port %s. Error: %s",
                         state.c_str(), port_name.c_str(), e.what());
-        mux_obj->rollbackStateChange();
+        if (mux_obj->isStateChangeInProgress() || mux_obj->isStateChangeFailed())
+            mux_obj->rollbackStateChange();
         return true;
     }
 
@@ -3058,16 +3335,13 @@ bool MuxStateOrch::addOperation(const Request& request)
         return false;
     }
 
-    if (mux_state != hw_state)
+    if (mux_obj->isStateChangeFailed())
     {
-        if (mux_obj->isStateChangeFailed())
-        {
-            mux_state = MUX_HW_STATE_ERROR;
-        }
-        else
-        {
-            mux_state = MUX_HW_STATE_UNKNOWN;
-        }
+        mux_state = MUX_HW_STATE_ERROR;
+    }
+    else if (mux_state != hw_state)
+    {
+        mux_state = MUX_HW_STATE_UNKNOWN;
     }
 
     SWSS_LOG_NOTICE("Mux setting State DB entry (hw state %s, mux state %s) for port %s",

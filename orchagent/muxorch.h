@@ -46,7 +46,7 @@ struct MuxRouteBulkContext
 {
     std::deque<sai_status_t>            object_statuses;            // Bulk statuses
     IpPrefix                            pfx;                        // Route prefix
-    sai_object_id_t                     nh;                         // nexthop id
+    sai_object_id_t                     nh = SAI_NULL_OBJECT_ID;    // nexthop id
 
     MuxRouteBulkContext(IpPrefix pfx)
         : pfx(pfx)
@@ -73,15 +73,17 @@ class MuxAclHandler
 public:
     MuxAclHandler(sai_object_id_t port, string alias);
     ~MuxAclHandler(void);
+    bool remove();
 
 private:
     void createMuxAclTable(sai_object_id_t port, string strTable);
-    void createMuxAclRule(shared_ptr<AclRulePacket> rule, string strTable);
+    bool createMuxAclRule(shared_ptr<AclRulePacket> rule, string strTable);
     void bindAllPorts(AclTable &acl_table);
 
     sai_object_id_t port_ = SAI_NULL_OBJECT_ID;
     bool is_ingress_acl_ = true;
     string alias_;
+    bool bound_ = false;
 };
 
 // IP to nexthop index mapping
@@ -102,6 +104,9 @@ public:
     MuxNeighbor getNeighbors() const { return neighbors_; };
     string getAlias() const { return alias_; };
     void clearBulkers() { gRouteBulker.clear(); };
+    bool prepareStateChange(bool require_local_nh = false);
+    bool rollback(bool active, sai_object_id_t tunnel_nh, bool prefix_based);
+    void commitStateChange();
 
 protected:
     bool removeRoutes(std::list<MuxRouteBulkContext>& bulk_ctx_list);
@@ -114,6 +119,24 @@ protected:
     MuxNeighbor neighbors_;
     string alias_;
     EntityBulker<sai_route_api_t> gRouteBulker;
+    struct NeighborProgress
+    {
+        sai_object_id_t nexthop;
+        int ref_count;
+        bool routes_started = false;
+        bool host_route_started = false;
+        bool host_route_created = false;
+        bool host_route_removed = false;
+        bool host_route_unknown = false;
+        uint32_t routes_changed = 0;
+        uint32_t routes_restored = 0;
+        bool members_local = false;
+        bool route_result_unknown = false;
+    };
+    std::map<IpAddress, NeighborProgress> transition_;
+    std::list<NeighborContext> neighbor_contexts_;
+    void startRouteUpdate(const IpAddress& ip, bool host_route = false);
+    bool updateNeighborRoutes(const NextHopKey& nh, bool active, bool prefix_based, bool restoring = false);
 };
 
 // Mux Prefix-Based Neighbor Handler for adding/removing neighbors with prefix-based routing
@@ -142,7 +165,7 @@ public:
     using handler_pair = pair<MuxStateChange, bool (MuxCable::*)()>;
     using state_machine_handlers = map<MuxStateChange, bool (MuxCable::*)()>;
 
-    void setState(string state);
+    bool setState(string state);
     void rollbackStateChange();
     string getState();
     bool isStateChangeInProgress() { return st_chg_in_progress_; }
@@ -160,11 +183,11 @@ public:
         return (hasSlicePrefix() && !ip.isV4() && slice_ip6_.isAddressInSubnet(ip));
     }
     void updateNeighbor(NextHopKey nh, bool add);
-    void updateRoutes();
+    bool updateRoutes();
     void updateRoutesForNextHop(NextHopKey nh);
 
     // Slice supernet route tracking (see refreshSliceRoute in muxorch.cpp).
-    void refreshSliceRoute();
+    bool refreshSliceRoute();
     sai_object_id_t getNextHopId(const NextHopKey nh)
     {
         return nbr_handler_->getNextHopId(nh);
@@ -188,7 +211,7 @@ private:
     MuxNbrHandlerType nbr_handler_type_;
 
     MuxState state_ = MuxState::MUX_STATE_INIT;
-    MuxState prev_state_;
+    MuxState prev_state_ = MuxState::MUX_STATE_INIT;
     bool st_chg_in_progress_ = false;
     bool st_chg_failed_ = false;
 
@@ -200,6 +223,8 @@ private:
 
     // Nexthop OID the slice route points at; NULL when not installed.
     sai_object_id_t slice_route_nh_oid_ = SAI_NULL_OBJECT_ID;
+    bool slice_route_was_present_ = false;
+    bool acl_was_present_ = false;
 
     MuxOrch *mux_orch_;
     MuxCableOrch *mux_cb_orch_;
@@ -311,7 +336,7 @@ public:
     sai_object_id_t getNextHopTunnelId(std::string tunnelKey, IpAddress& ipAddr);
     sai_object_id_t getTunnelNextHopId();
 
-    void updateRoute(const IpPrefix &pfx);
+    bool updateRoute(const IpPrefix &pfx);
     bool isStandaloneTunnelRouteInstalled(const IpAddress& neighborIp);
 
     void enableCachingNeighborUpdate()

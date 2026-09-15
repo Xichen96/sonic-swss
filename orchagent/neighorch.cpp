@@ -378,7 +378,7 @@ bool NeighOrch::addNextHop(NeighborContext& ctx)
         nexthop.alias = inbp.m_alias;
     }
 
-    assert(!hasNextHop(nexthop));
+    assert(getLocalNextHopId(nexthop) == SAI_NULL_OBJECT_ID);
     sai_object_id_t rif_id = m_intfsOrch->getRouterIntfsId(nh.alias);
 
     vector<sai_attribute_t> next_hop_attrs;
@@ -420,7 +420,9 @@ bool NeighOrch::addNextHop(NeighborContext& ctx)
 
     if (ctx.bulk_op)
     {
-        gNextHopBulker.create_entry(&ctx.next_hop_id , (uint32_t)next_hop_attrs.size(), next_hop_attrs.data());
+        ctx.nexthop_requested = true;
+        gNextHopBulker.create_entry(&ctx.next_hop_id, (uint32_t)next_hop_attrs.size(),
+                                   next_hop_attrs.data(), &ctx.nexthop_status);
         return true;
     }
 
@@ -516,22 +518,11 @@ bool NeighOrch::processBulkAddNextHop(NeighborContext& ctx)
     }
 
     NextHopKey nexthop(nh);
-    if (ctx.next_hop_id == SAI_NULL_OBJECT_ID)
+    if (ctx.next_hop_id == SAI_NULL_OBJECT_ID || ctx.nexthop_status != SAI_STATUS_SUCCESS)
     {
-        sai_status_t bulker_status = gNextHopBulker.create_status(ctx.next_hop_id);
-        if (bulker_status == SAI_STATUS_ITEM_ALREADY_EXISTS)
-        {
-            SWSS_LOG_NOTICE("Next hop %s on %s already exists",
-                        nexthop.ip_address.to_string().c_str(), nexthop.alias.c_str());
-            return true;
-        }
         SWSS_LOG_ERROR("Failed to create next hop %s on %s, rv:%d",
-                       nexthop.ip_address.to_string().c_str(), nexthop.alias.c_str(), bulker_status);
-        task_process_status handle_status = handleSaiCreateStatus(SAI_API_NEXT_HOP, bulker_status);
-        if (handle_status != task_success)
-        {
-            return parseHandleSaiStatusFailure(handle_status);
-        }
+                       nexthop.ip_address.to_string().c_str(), nexthop.alias.c_str(), ctx.nexthop_status);
+        return false;
     }
 
     SWSS_LOG_NOTICE("Created next hop %s on %s",
@@ -548,6 +539,7 @@ bool NeighOrch::processBulkAddNextHop(NeighborContext& ctx)
     next_hop_entry.ref_count = 0;
     next_hop_entry.nh_flags = 0;
     m_syncdNextHops[nexthop] = next_hop_entry;
+    ctx.nexthop_created = true;
 
     m_intfsOrch->increaseRouterIntfsRefCount(nh.alias);
 
@@ -567,7 +559,7 @@ bool NeighOrch::processBulkAddNextHop(NeighborContext& ctx)
         }
     }
 
-    gFgNhgOrch->validNextHopInNextHopGroup(nexthop);
+    bool ret = gFgNhgOrch->validNextHopInNextHopGroup(nexthop);
 
     // For nexthop with incoming port which has down oper status, NHFLAGS_IFDOWN
     // flag should be set on it.
@@ -579,9 +571,10 @@ bool NeighOrch::processBulkAddNextHop(NeighborContext& ctx)
         {
             SWSS_LOG_WARN("Failed to set NHFLAGS_IFDOWN on nexthop %s for interface %s",
                 nexthop.ip_address.to_string().c_str(), nexthop.alias.c_str());
+            ret = false;
         }
     }
-    return true;
+    return ret;
 }
 
 bool NeighOrch::setNextHopFlag(const NextHopKey &nexthop, const uint32_t nh_flag)
@@ -1477,16 +1470,20 @@ bool NeighOrch::addNeighbor(NeighborContext& ctx)
         }
     }
 
+    if (bulk_op && hw_config && nbr_add_ready)
+    {
+        return getLocalNextHopId(neighborEntry) != SAI_NULL_OBJECT_ID || addNextHop(ctx);
+    }
+
     if (!hw_config && nbr_add_ready)
     {
         // prefix-route neighbors do not use bulk_op
         if (bulk_op)
         {
             SWSS_LOG_INFO("Adding neighbor entry %s on %s to bulker.", ip_address.to_string().c_str(), alias.c_str());
-            object_statuses.emplace_back();
+            object_statuses.emplace_back(SAI_STATUS_NOT_EXECUTED);
             gNeighBulker.create_entry(&object_statuses.back(), &neighbor_entry, (uint32_t)neighbor_attrs.size(), neighbor_attrs.data());
-            addNextHop(ctx);
-            return true;
+            return getLocalNextHopId(neighborEntry) != SAI_NULL_OBJECT_ID || addNextHop(ctx);
         }
 
         status = sai_neighbor_api->create_neighbor_entry(&neighbor_entry,
@@ -1665,13 +1662,18 @@ bool NeighOrch::removeNeighbor(NeighborContext& ctx, bool disable)
         neighbor_entry.switch_id = gSwitchId;
         copy(neighbor_entry.ip_address, ip_address);
 
-        sai_object_id_t next_hop_id = m_syncdNextHops[nexthop].next_hop_id;
+        sai_object_id_t next_hop_id = getLocalNextHopId(nexthop);
 
         // prefix-route mux neighbors do not use bulk_op
         if (bulk_op)
         {
-            object_statuses.emplace_back();
-            gNextHopBulker.remove_entry(&ctx.nexthop_status, next_hop_id);
+            object_statuses.emplace_back(SAI_STATUS_NOT_EXECUTED);
+            ctx.next_hop_id = next_hop_id;
+            if (next_hop_id != SAI_NULL_OBJECT_ID)
+            {
+                ctx.nexthop_requested = true;
+                gNextHopBulker.remove_entry(&ctx.nexthop_status, next_hop_id);
+            }
             gNeighBulker.remove_entry(&object_statuses.back(), &neighbor_entry);
             return true;
         }
@@ -1775,212 +1777,107 @@ bool NeighOrch::removeNeighbor(NeighborContext& ctx, bool disable)
 bool NeighOrch::processBulkEnableNeighbor(NeighborContext& ctx)
 {
     SWSS_LOG_ENTER();
-
-    const auto& object_statuses = ctx.object_statuses;
-    auto it_status = object_statuses.begin();
-    sai_status_t status;
-
-    const MacAddress &macAddress = ctx.mac;
-    const NeighborEntry neighborEntry = ctx.neighborEntry;
-    string alias = neighborEntry.alias;
-    IpAddress ip_address = neighborEntry.ip_address;
-
     if (!ctx.bulk_op)
     {
-        SWSS_LOG_INFO("Not a bulk entry for %s on %s", ip_address.to_string().c_str(), alias.c_str());
         return true;
     }
-
-    SWSS_LOG_INFO("Checking neighbor create entry status %s on %s.", ip_address.to_string().c_str(), alias.c_str());
-
-    sai_object_id_t rif_id = m_intfsOrch->getRouterIntfsId(alias);
-    if (rif_id == SAI_NULL_OBJECT_ID)
+    auto neighbor = m_syncdNeighbors.find(ctx.neighborEntry);
+    if (neighbor == m_syncdNeighbors.end())
     {
-        SWSS_LOG_INFO("Failed to get rif_id for %s", alias.c_str());
         return false;
     }
-
-    sai_neighbor_entry_t neighbor_entry;
-    neighbor_entry.rif_id = rif_id;
-    neighbor_entry.switch_id = gSwitchId;
-    copy(neighbor_entry.ip_address, ip_address);
-
-    MuxOrch* mux_orch = gDirectory.get<MuxOrch*>();
-    if (mux_orch->isNeighborActive(ip_address, macAddress, alias))
+    bool ret = true;
+    if (!ctx.object_statuses.empty())
     {
-        status = *it_status++;
-        if (status != SAI_STATUS_SUCCESS)
+        auto status = ctx.object_statuses.front();
+        if (status == SAI_STATUS_SUCCESS || status == SAI_STATUS_ITEM_ALREADY_EXISTS)
         {
-            if (status == SAI_STATUS_ITEM_ALREADY_EXISTS)
+            ctx.neighbor_created = status == SAI_STATUS_SUCCESS;
+            if (!neighbor->second.hw_configured)
             {
-                SWSS_LOG_INFO("Neighbor exists: neighbor %s on %s, reconciling: status:%s",
-                           macAddress.to_string().c_str(), alias.c_str(), sai_serialize_status(status).c_str());
+                m_intfsOrch->increaseRouterIntfsRefCount(ctx.neighborEntry.alias);
+                gCrmOrch->incCrmResUsedCounter(ctx.neighborEntry.ip_address.isV4()
+                    ? CrmResourceType::CRM_IPV4_NEIGHBOR : CrmResourceType::CRM_IPV6_NEIGHBOR);
+                neighbor->second.hw_configured = true;
             }
-            else
-            {
-                SWSS_LOG_ERROR("Failed to create neighbor %s on %s, status:%s",
-                           macAddress.to_string().c_str(), alias.c_str(), sai_serialize_status(status).c_str());
-                task_process_status handle_status = handleSaiCreateStatus(SAI_API_NEIGHBOR, status);
-                if (handle_status != task_success)
-                {
-                    return parseHandleSaiStatusFailure(handle_status);
-                }
-            }
-        }
-
-        SWSS_LOG_NOTICE("Created neighbor ip %s, %s on %s", ip_address.to_string().c_str(),
-                macAddress.to_string().c_str(), alias.c_str());
-
-        m_intfsOrch->increaseRouterIntfsRefCount(alias);
-
-        if (neighbor_entry.ip_address.addr_family == SAI_IP_ADDR_FAMILY_IPV4)
-        {
-            gCrmOrch->incCrmResUsedCounter(CrmResourceType::CRM_IPV4_NEIGHBOR);
         }
         else
         {
-            gCrmOrch->incCrmResUsedCounter(CrmResourceType::CRM_IPV6_NEIGHBOR);
-        }
-
-        if (!processBulkAddNextHop(ctx))
-        {
-            status = sai_neighbor_api->remove_neighbor_entry(&neighbor_entry);
-            if (status != SAI_STATUS_SUCCESS)
-            {
-                SWSS_LOG_ERROR("Failed to remove neighbor %s on %s, rv:%d",
-                               macAddress.to_string().c_str(), alias.c_str(), status);
-                task_process_status handle_status = handleSaiRemoveStatus(SAI_API_NEIGHBOR, status);
-                if (handle_status != task_success)
-                {
-                    return parseHandleSaiStatusFailure(handle_status);
-                }
-            }
-            m_intfsOrch->decreaseRouterIntfsRefCount(alias);
-
-            if (neighbor_entry.ip_address.addr_family == SAI_IP_ADDR_FAMILY_IPV4)
-            {
-                gCrmOrch->decCrmResUsedCounter(CrmResourceType::CRM_IPV4_NEIGHBOR);
-            }
-            else
-            {
-                gCrmOrch->decCrmResUsedCounter(CrmResourceType::CRM_IPV6_NEIGHBOR);
-            }
-
-            return false;
+            SWSS_LOG_ERROR("Bulk neighbor create failed for %s: %s",
+                           ctx.neighborEntry.to_string().c_str(), sai_serialize_status(status).c_str());
+            ret = false;
         }
     }
-
-    m_syncdNeighbors[neighborEntry] = { macAddress, true };
-
-    NeighborUpdate update = { neighborEntry, macAddress, true };
-    notify(SUBJECT_TYPE_NEIGH_CHANGE, static_cast<void *>(&update));
-
-    return true;
+    // Both bulks have executed: account for a successful NH even if its neighbor failed.
+    ctx.nexthop_created = ctx.nexthop_requested && ctx.nexthop_status == SAI_STATUS_SUCCESS &&
+                          ctx.next_hop_id != SAI_NULL_OBJECT_ID;
+    if (ctx.nexthop_requested && !processBulkAddNextHop(ctx))
+    {
+        ret = false;
+    }
+    if (ret && neighbor->second.hw_configured &&
+        getLocalNextHopId(ctx.neighborEntry) != SAI_NULL_OBJECT_ID)
+    {
+        NeighborUpdate update = { ctx.neighborEntry, ctx.mac, true };
+        notify(SUBJECT_TYPE_NEIGH_CHANGE, static_cast<void *>(&update));
+        return true;
+    }
+    return false;
 }
 
 /* Process bulk ctx entry and disable the neigbor */
 bool NeighOrch::processBulkDisableNeighbor(NeighborContext& ctx)
 {
     SWSS_LOG_ENTER();
-
-    const auto& object_statuses = ctx.object_statuses;
-    auto it_status = object_statuses.begin();
-    sai_status_t status;
-
-    const NeighborEntry neighborEntry = ctx.neighborEntry;
-    string alias = neighborEntry.alias;
-    IpAddress ip_address = neighborEntry.ip_address;
-
-    if (m_syncdNeighbors.find(neighborEntry) == m_syncdNeighbors.end())
+    auto neighbor = m_syncdNeighbors.find(ctx.neighborEntry);
+    if (neighbor == m_syncdNeighbors.end())
     {
-        return true;
+        return false;
     }
-
-    SWSS_LOG_INFO("Checking neighbor remove entry status %s on %s.", ip_address.to_string().c_str(), m_syncdNeighbors[neighborEntry].mac.to_string().c_str());
-
-    if (isHwConfigured(neighborEntry))
+    bool ret = true;
+    if (ctx.nexthop_requested)
     {
-        sai_object_id_t rif_id = m_intfsOrch->getRouterIntfsId(alias);
-
-        sai_neighbor_entry_t neighbor_entry;
-        neighbor_entry.rif_id = rif_id;
-        neighbor_entry.switch_id = gSwitchId;
-        copy(neighbor_entry.ip_address, ip_address);
-
-        if (ctx.nexthop_status != SAI_STATUS_SUCCESS)
+        if (ctx.nexthop_status == SAI_STATUS_SUCCESS || ctx.nexthop_status == SAI_STATUS_ITEM_NOT_FOUND)
         {
-            /* When next hop is not found, we continue to remove neighbor entry. */
-            if (ctx.nexthop_status == SAI_STATUS_ITEM_NOT_FOUND)
+            auto nh = m_syncdNextHops.find(ctx.neighborEntry);
+            if (nh != m_syncdNextHops.end())
             {
-                SWSS_LOG_NOTICE("Next hop %s on %s doesn't exist, rv:%d",
-                               ip_address.to_string().c_str(), alias.c_str(), ctx.nexthop_status);
+                m_syncdNextHops.erase(nh);
+                m_intfsOrch->decreaseRouterIntfsRefCount(ctx.neighborEntry.alias);
+                gCrmOrch->decCrmResUsedCounter(ctx.neighborEntry.ip_address.isV4()
+                    ? CrmResourceType::CRM_IPV4_NEXTHOP : CrmResourceType::CRM_IPV6_NEXTHOP);
             }
-            else
-            {
-                SWSS_LOG_ERROR("Failed to remove next hop %s on %s, rv:%d",
-                               ip_address.to_string().c_str(), alias.c_str(), ctx.nexthop_status);
-                task_process_status handle_status = handleSaiRemoveStatus(SAI_API_NEXT_HOP, ctx.nexthop_status);
-                if (handle_status != task_success)
-                {
-                    return parseHandleSaiStatusFailure(handle_status);
-                }
-            }
-        }
-
-        if (ctx.nexthop_status != SAI_STATUS_ITEM_NOT_FOUND)
-        {
-            if (neighbor_entry.ip_address.addr_family == SAI_IP_ADDR_FAMILY_IPV4)
-            {
-                gCrmOrch->decCrmResUsedCounter(CrmResourceType::CRM_IPV4_NEXTHOP);
-            }
-            else
-            {
-                gCrmOrch->decCrmResUsedCounter(CrmResourceType::CRM_IPV6_NEXTHOP);
-            }
-        }
-
-        SWSS_LOG_NOTICE("Bulk removed next hop %s on %s", ip_address.to_string().c_str(), alias.c_str());
-
-        status = *it_status++;
-        if (status != SAI_STATUS_SUCCESS)
-        {
-            if (status == SAI_STATUS_ITEM_NOT_FOUND)
-            {
-                SWSS_LOG_NOTICE("Bulk remove entry skipped, neighbor %s on %s already removed, rv:%d",
-                        m_syncdNeighbors[neighborEntry].mac.to_string().c_str(), alias.c_str(), status);
-            }
-            else
-            {
-                SWSS_LOG_ERROR("Failed to remove neighbor %s on %s, rv:%d",
-                        m_syncdNeighbors[neighborEntry].mac.to_string().c_str(), alias.c_str(), status);
-                task_process_status handle_status = handleSaiRemoveStatus(SAI_API_NEIGHBOR, status);
-                if (handle_status != task_success)
-                {
-                    return parseHandleSaiStatusFailure(handle_status);
-                }
-            }
+            ctx.nexthop_removed = true;
         }
         else
         {
-            if (neighbor_entry.ip_address.addr_family == SAI_IP_ADDR_FAMILY_IPV4)
-            {
-                gCrmOrch->decCrmResUsedCounter(CrmResourceType::CRM_IPV4_NEIGHBOR);
-            }
-            else
-            {
-                gCrmOrch->decCrmResUsedCounter(CrmResourceType::CRM_IPV6_NEIGHBOR);
-            }
-
-            removeNextHop(ip_address, alias);
-            m_intfsOrch->decreaseRouterIntfsRefCount(alias);
-            SWSS_LOG_NOTICE("Removed neighbor %s on %s",
-                    m_syncdNeighbors[neighborEntry].mac.to_string().c_str(), alias.c_str());
+            SWSS_LOG_ERROR("Bulk next hop remove failed for %s: %s",
+                           ctx.neighborEntry.to_string().c_str(), sai_serialize_status(ctx.nexthop_status).c_str());
+            ret = false;
         }
     }
-
-    /* Do not delete entry from cache for disable request */
-    m_syncdNeighbors[neighborEntry].hw_configured = false;
-    return true;
+    if (!ctx.object_statuses.empty())
+    {
+        auto status = ctx.object_statuses.front();
+        if (status == SAI_STATUS_SUCCESS || status == SAI_STATUS_ITEM_NOT_FOUND)
+        {
+            if (neighbor->second.hw_configured)
+            {
+                neighbor->second.hw_configured = false;
+                m_intfsOrch->decreaseRouterIntfsRefCount(ctx.neighborEntry.alias);
+                gCrmOrch->decCrmResUsedCounter(ctx.neighborEntry.ip_address.isV4()
+                    ? CrmResourceType::CRM_IPV4_NEIGHBOR : CrmResourceType::CRM_IPV6_NEIGHBOR);
+            }
+            ctx.neighbor_removed = true;
+        }
+        else
+        {
+            SWSS_LOG_ERROR("Bulk neighbor remove failed for %s: %s",
+                           ctx.neighborEntry.to_string().c_str(), sai_serialize_status(status).c_str());
+            ret = false;
+        }
+    }
+    return ret;
 }
 
 bool NeighOrch::isHwConfigured(const NeighborEntry& neighborEntry)
@@ -2054,7 +1951,7 @@ bool NeighOrch::enableNeighbors(std::list<NeighborContext>& bulk_ctx_list)
         }
         ctx->mac = neighborIt->second.mac;
 
-        if (isHwConfigured(neighborEntry))
+        if (isHwConfigured(neighborEntry) && getLocalNextHopId(neighborEntry) != SAI_NULL_OBJECT_ID)
         {
             SWSS_LOG_INFO("Neighbor %s is already programmed to HW", neighborEntry.ip_address.to_string().c_str());
             continue;
@@ -2070,26 +1967,49 @@ bool NeighOrch::enableNeighbors(std::list<NeighborContext>& bulk_ctx_list)
         }
     }
 
-    gNeighBulker.flush();
-    gNextHopBulker.flush();
+    try
+    {
+        gNeighBulker.flush();
+        gNextHopBulker.flush();
+    }
+    catch (const std::exception& e)
+    {
+        SWSS_LOG_ERROR("MUX neighbor create bulk interrupted: %s", e.what());
+        ret = false;
+        for (auto& ctx : bulk_ctx_list)
+        {
+            ctx.result_unknown = (!ctx.object_statuses.empty() &&
+                                  ctx.object_statuses.front() == SAI_STATUS_NOT_EXECUTED) ||
+                                 (ctx.nexthop_requested && ctx.nexthop_status == SAI_STATUS_NOT_EXECUTED);
+        }
+    }
 
     for (auto ctx = bulk_ctx_list.begin(); ctx != bulk_ctx_list.end(); ctx++)
     {
-        if (ctx->object_statuses.empty())
+        if (ctx->object_statuses.empty() && !ctx->nexthop_requested)
         {
             continue;
         }
 
         const NeighborEntry& neighborEntry = ctx->neighborEntry;
-        if (!processBulkEnableNeighbor(*ctx))
+        try
         {
-            SWSS_LOG_INFO("Enable neighbor failed for %s", neighborEntry.ip_address.to_string().c_str());
-            /* finish processing bulk entries */
+            if (!processBulkEnableNeighbor(*ctx))
+            {
+                SWSS_LOG_INFO("Enable neighbor failed for %s", neighborEntry.ip_address.to_string().c_str());
+                ret = false;
+            }
+        }
+        catch (const std::exception& e)
+        {
+            SWSS_LOG_ERROR("Enable result handling interrupted for %s: %s",
+                           neighborEntry.to_string().c_str(), e.what());
+            ctx->result_unknown = true;
             ret = false;
         }
     }
 
-    gNeighBulker.clear();
+    clearBulkers();
     return ret;
 }
 
@@ -2119,8 +2039,22 @@ bool NeighOrch::disableNeighbors(std::list<NeighborContext>& bulk_ctx_list)
         }
     }
 
-    gNextHopBulker.flush();
-    gNeighBulker.flush();
+    try
+    {
+        gNextHopBulker.flush();
+        gNeighBulker.flush();
+    }
+    catch (const std::exception& e)
+    {
+        SWSS_LOG_ERROR("MUX neighbor remove bulk interrupted: %s", e.what());
+        ret = false;
+        for (auto& ctx : bulk_ctx_list)
+        {
+            ctx.result_unknown = (!ctx.object_statuses.empty() &&
+                                  ctx.object_statuses.front() == SAI_STATUS_NOT_EXECUTED) ||
+                                 (ctx.nexthop_requested && ctx.nexthop_status == SAI_STATUS_NOT_EXECUTED);
+        }
+    }
 
     for (auto ctx = bulk_ctx_list.begin(); ctx != bulk_ctx_list.end(); ctx++)
     {
@@ -2130,15 +2064,110 @@ bool NeighOrch::disableNeighbors(std::list<NeighborContext>& bulk_ctx_list)
         }
 
         const NeighborEntry& neighborEntry = ctx->neighborEntry;
-        if (!processBulkDisableNeighbor(*ctx))
+        try
         {
-            SWSS_LOG_INFO("Disable neighbor failed for %s", neighborEntry.ip_address.to_string().c_str());
-            /* finish processing bulk entries but return false */
+            if (!processBulkDisableNeighbor(*ctx))
+            {
+                SWSS_LOG_INFO("Disable neighbor failed for %s", neighborEntry.ip_address.to_string().c_str());
+                ret = false;
+            }
+        }
+        catch (const std::exception& e)
+        {
+            SWSS_LOG_ERROR("Disable result handling interrupted for %s: %s",
+                           neighborEntry.to_string().c_str(), e.what());
+            ctx->result_unknown = true;
             ret = false;
         }
     }
 
-    gNeighBulker.clear();
+    clearBulkers();
+    return ret;
+}
+
+bool NeighOrch::restoreNeighbors(std::list<NeighborContext>& contexts, bool active)
+{
+    bool ret = true;
+    for (auto& ctx : contexts)
+    {
+        ret = !ctx.result_unknown && ret;
+        try
+        {
+            if (active)
+            {
+                if (!ctx.neighbor_removed && !ctx.nexthop_removed)
+                {
+                    continue;
+                }
+                std::list<NeighborContext> restore{NeighborContext(ctx.neighborEntry, true)};
+                if (!enableNeighbors(restore))
+                {
+                    ret = false;
+                    continue;
+                }
+                ctx.neighbor_removed = false;
+                ctx.nexthop_removed = false;
+                continue;
+            }
+
+            // Only remove objects created by this attempt, never adopted existing objects.
+            if (ctx.nexthop_created)
+            {
+                auto nh = m_syncdNextHops.find(ctx.neighborEntry);
+                if (nh != m_syncdNextHops.end() && nh->second.ref_count != 0)
+                {
+                    ret = false;
+                    continue;
+                }
+                auto status = sai_next_hop_api->remove_next_hop(ctx.next_hop_id);
+                if (status != SAI_STATUS_SUCCESS && status != SAI_STATUS_ITEM_NOT_FOUND)
+                {
+                    SWSS_LOG_ERROR("MUX rollback next hop remove failed for %s: %s",
+                                   ctx.neighborEntry.to_string().c_str(), sai_serialize_status(status).c_str());
+                    ret = false;
+                    continue;
+                }
+                if (nh != m_syncdNextHops.end())
+                {
+                    m_syncdNextHops.erase(nh);
+                    m_intfsOrch->decreaseRouterIntfsRefCount(ctx.neighborEntry.alias);
+                    gCrmOrch->decCrmResUsedCounter(ctx.neighborEntry.ip_address.isV4()
+                        ? CrmResourceType::CRM_IPV4_NEXTHOP : CrmResourceType::CRM_IPV6_NEXTHOP);
+                }
+                ctx.nexthop_created = false;
+            }
+            if (ctx.neighbor_created)
+            {
+                sai_neighbor_entry_t entry{};
+                entry.switch_id = gSwitchId;
+                entry.rif_id = m_intfsOrch->getRouterIntfsId(ctx.neighborEntry.alias);
+                copy(entry.ip_address, ctx.neighborEntry.ip_address);
+                auto status = sai_neighbor_api->remove_neighbor_entry(&entry);
+                if (status != SAI_STATUS_SUCCESS && status != SAI_STATUS_ITEM_NOT_FOUND)
+                {
+                    SWSS_LOG_ERROR("MUX rollback neighbor remove failed for %s: %s",
+                                   ctx.neighborEntry.to_string().c_str(), sai_serialize_status(status).c_str());
+                    ret = false;
+                    continue;
+                }
+                auto neighbor = m_syncdNeighbors.find(ctx.neighborEntry);
+                if (neighbor != m_syncdNeighbors.end())
+                {
+                    neighbor->second.hw_configured = false;
+                }
+                m_intfsOrch->decreaseRouterIntfsRefCount(ctx.neighborEntry.alias);
+                gCrmOrch->decCrmResUsedCounter(ctx.neighborEntry.ip_address.isV4()
+                    ? CrmResourceType::CRM_IPV4_NEIGHBOR : CrmResourceType::CRM_IPV6_NEIGHBOR);
+                ctx.neighbor_created = false;
+            }
+        }
+        catch (const std::exception& e)
+        {
+            SWSS_LOG_ERROR("MUX neighbor rollback interrupted for %s: %s",
+                           ctx.neighborEntry.to_string().c_str(), e.what());
+            ret = false;
+        }
+    }
     return ret;
 }
 
