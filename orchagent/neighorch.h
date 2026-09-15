@@ -54,8 +54,14 @@ struct NeighborContext
     std::deque<sai_status_t>            object_statuses;            // entity bulk statuses for neighbors
     MacAddress                          mac;                        // neighbor mac
     bool                                bulk_op = false;            // use bulker (only for mux use for now)
-    sai_object_id_t                     next_hop_id;                // next hop id
-    sai_status_t                        nexthop_status;             // next hop status
+    sai_object_id_t                     next_hop_id = SAI_NULL_OBJECT_ID;
+    sai_status_t                        nexthop_status = SAI_STATUS_NOT_EXECUTED;
+    bool                                nexthop_requested = false;
+    bool                                neighbor_created = false;
+    bool                                nexthop_created = false;
+    bool                                neighbor_removed = false;
+    bool                                nexthop_removed = false;
+    bool                                result_unknown = false;
 
     NeighborContext(NeighborEntry neighborEntry)
         : neighborEntry(neighborEntry)
@@ -96,6 +102,7 @@ public:
     bool disableNeighbor(const NeighborEntry&);
     bool enableNeighbors(std::list<NeighborContext>&);
     bool disableNeighbors(std::list<NeighborContext>&);
+    bool restoreNeighbors(std::list<NeighborContext>&, bool active);
     bool isHwConfigured(const NeighborEntry&);
     void processFDBDelete(const FdbEntry &entry);
     void processFDBAdd(const FdbEntry &entry);

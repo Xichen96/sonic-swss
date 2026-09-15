@@ -450,7 +450,17 @@ bool RouteOrch::addDefaultRouteNexthopsInNextHopGroup(NextHopGroupEntry& origina
     return true;
 }
 
-bool RouteOrch::validnexthopinNextHopGroup(const NextHopKey &nexthop, uint32_t& count)
+bool RouteOrch::hasDefaultRouteNextHopGroup(const NextHopKey& nexthop) const
+{
+    for (const auto& group : m_syncdNextHopGroups)
+    {
+        if (group.first.contains(nexthop) && group.second.is_default_route_nh_swap)
+            return true;
+    }
+    return false;
+}
+
+bool RouteOrch::validnexthopinNextHopGroup(const NextHopKey &nexthop, uint32_t& count, bool mux_transition, bool local_ref)
 {
     SWSS_LOG_ENTER();
 
@@ -474,6 +484,20 @@ bool RouteOrch::validnexthopinNextHopGroup(const NextHopKey &nexthop, uint32_t& 
            continue;
         }
         
+        auto& member = nhopgroup->second.nhopgroup_members[nexthop];
+        if (mux_transition && member.next_hop_id != SAI_NULL_OBJECT_ID)
+        {
+            continue;
+        }
+        if (mux_transition && local_ref && m_neighOrch->isNextHopFlagSet(nexthop, NHFLAGS_IFDOWN))
+        {
+            if (member.mux_ref_released)
+            {
+                member.mux_ref_released = false;
+                ++count;
+            }
+            continue;
+        }
         vector<sai_attribute_t> nhgm_attrs;
         sai_attribute_t nhgm_attr;
 
@@ -510,6 +534,10 @@ bool RouteOrch::validnexthopinNextHopGroup(const NextHopKey &nexthop, uint32_t& 
         {
             SWSS_LOG_ERROR("Failed to add next hop member to group %" PRIx64 ": %d\n",
                            nhopgroup->second.next_hop_group_id, status);
+            if (mux_transition)
+            {
+                return false;
+            }
             task_process_status handle_status = handleSaiCreateStatus(SAI_API_NEXT_HOP_GROUP, status);
             if (handle_status != task_success)
             {
@@ -520,6 +548,8 @@ bool RouteOrch::validnexthopinNextHopGroup(const NextHopKey &nexthop, uint32_t& 
         ++count;
         gCrmOrch->incCrmResUsedCounter(CrmResourceType::CRM_NEXTHOP_GROUP_MEMBER);
         nhopgroup->second.nhopgroup_members[nexthop].next_hop_id = nexthop_id;
+        if (mux_transition)
+            member.mux_ref_released = !local_ref;
         /* Keep the count of number of nexthop members are present in Nexthop Group
          * when the links became active again*/
         nhopgroup->second.nh_member_install_count++;
@@ -533,7 +563,7 @@ bool RouteOrch::validnexthopinNextHopGroup(const NextHopKey &nexthop, uint32_t& 
     return true;
 }
 
-bool RouteOrch::invalidnexthopinNextHopGroup(const NextHopKey &nexthop, uint32_t& count)
+bool RouteOrch::invalidnexthopinNextHopGroup(const NextHopKey &nexthop, uint32_t& count, bool mux_transition, bool local_ref)
 {
     SWSS_LOG_ENTER();
 
@@ -558,19 +588,37 @@ bool RouteOrch::invalidnexthopinNextHopGroup(const NextHopKey &nexthop, uint32_t
         }
  
 
-        nexthop_id = nhopgroup->second.nhopgroup_members[nexthop].next_hop_id;
+        auto& member = nhopgroup->second.nhopgroup_members[nexthop];
+        nexthop_id = member.next_hop_id;
+        if (nexthop_id == SAI_NULL_OBJECT_ID)
+        {
+            // Interface-down removes hardware members but retains logical references.
+            if (mux_transition && local_ref && !member.mux_ref_released)
+                ++count;
+            if (mux_transition)
+                member.mux_ref_released = true;
+            continue;
+        }
         status = sai_next_hop_group_api->remove_next_hop_group_member(nexthop_id);
 
         if (status != SAI_STATUS_SUCCESS)
         {
             SWSS_LOG_ERROR("Failed to remove next hop member %" PRIx64 " from group %" PRIx64 ": %d\n",
                            nexthop_id, nhopgroup->second.next_hop_group_id, status);
-            task_process_status handle_status = handleSaiRemoveStatus(SAI_API_NEXT_HOP_GROUP, status);
-            if (handle_status != task_success)
+            if (mux_transition && status != SAI_STATUS_ITEM_NOT_FOUND)
             {
-                return parseHandleSaiStatusFailure(handle_status);
+                return false;
+            }
+            if (!mux_transition)
+            {
+                task_process_status handle_status = handleSaiRemoveStatus(SAI_API_NEXT_HOP_GROUP, status);
+                if (handle_status != task_success)
+                {
+                    return parseHandleSaiStatusFailure(handle_status);
+                }
             }
         }
+        nhopgroup->second.nhopgroup_members[nexthop].next_hop_id = SAI_NULL_OBJECT_ID;
         // Reduce the member install count when links down
         if (nhopgroup->second.nh_member_install_count)
         {
@@ -589,7 +637,10 @@ bool RouteOrch::invalidnexthopinNextHopGroup(const NextHopKey &nexthop, uint32_t
                 addDefaultRouteNexthopsInNextHopGroup(nhopgroup->second, v6_active_default_route_nhops);
             }
         }
-        ++count;
+        if (!mux_transition || !local_ref || !member.mux_ref_released)
+            ++count;
+        if (mux_transition)
+            member.mux_ref_released = true;
         gCrmOrch->decCrmResUsedCounter(CrmResourceType::CRM_NEXTHOP_GROUP_MEMBER);
     }
 
@@ -1696,11 +1747,19 @@ bool RouteOrch::removeNextHopGroup(const NextHopGroupKey &nexthops, const bool i
     SWSS_LOG_NOTICE("Delete next hop group %s", nexthops.to_string().c_str());
 
     vector<sai_object_id_t> next_hop_ids;
+    set<NextHopKey> mux_released_members;
     /* If the NexthopGroup is the one that has been swapped with default route members
      * than when deleting such Nexthop Group we have to remove default route nexthop group members */
     auto& nhgm = is_default_route_nh_swap ? next_hop_group_entry->second.default_route_nhopgroup_members : next_hop_group_entry->second.nhopgroup_members;
     for (auto nhop = nhgm.begin(); nhop != nhgm.end();)
     {
+        if (nhop->second.mux_ref_released)
+            mux_released_members.insert(nhop->first);
+        if (nhop->second.next_hop_id == SAI_NULL_OBJECT_ID)
+        {
+            nhop = nhgm.erase(nhop);
+            continue;
+        }
         /* This check we skip for Nexthop Group that has been swapped 
          * as Nexthop Group Members are not original member which are already removed 
          * as part of API invalidnexthopinNextHopGroup */
@@ -1770,7 +1829,7 @@ bool RouteOrch::removeNextHopGroup(const NextHopGroupKey &nexthops, const bool i
     {
         // Skip mux tunnel next hops (consistent with addNextHopGroup)
         auto nh_id = m_neighOrch->getNextHopId(it);
-        if (nh_id != mux_tunnel_nh_id)
+        if (nh_id != mux_tunnel_nh_id && !mux_released_members.count(it))
         {
             m_neighOrch->decreaseNextHopRefCount(it);
         }
@@ -1868,7 +1927,7 @@ void RouteOrch::removeNextHopRoute(const NextHopKey& nextHop, const RouteKey& ro
     }
 }
 
-bool RouteOrch::updateNextHopRoutes(const NextHopKey& nextHop, uint32_t& numRoutes)
+bool RouteOrch::updateNextHopRoutes(const NextHopKey& nextHop, uint32_t& numRoutes, bool mux_transition)
 {
     numRoutes = 0;
     auto it = m_nextHops.find((nextHop));
@@ -1914,6 +1973,10 @@ bool RouteOrch::updateNextHopRoutes(const NextHopKey& nextHop, uint32_t& numRout
         if (status != SAI_STATUS_SUCCESS)
         {
             SWSS_LOG_ERROR("Failed to update route %s, rv:%d", (*rt).prefix.to_string().c_str(), status);
+            if (mux_transition)
+            {
+                return false;
+            }
             task_process_status handle_status = handleSaiSetStatus(SAI_API_ROUTE, status);
             if (handle_status != task_success)
             {

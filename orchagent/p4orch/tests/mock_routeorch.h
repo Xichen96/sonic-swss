@@ -28,6 +28,7 @@ struct NextHopGroupMemberEntry
 {
     sai_object_id_t  next_hop_id; // next hop sai oid
     uint32_t         seq_id; // Sequence Id of nexthop in the group
+    bool            mux_ref_released = false;
 };
 
 typedef std::map<NextHopKey, NextHopGroupMemberEntry> NextHopGroupMembers;
@@ -200,11 +201,12 @@ public:
 
     void addNextHopRoute(const NextHopKey&, const RouteKey&);
     void removeNextHopRoute(const NextHopKey&, const RouteKey&);
-    bool updateNextHopRoutes(const NextHopKey&, uint32_t&);
+    bool updateNextHopRoutes(const NextHopKey&, uint32_t&, bool mux_transition = false);
     bool getRoutesForNexthop(std::set<RouteKey>&, const NextHopKey&);
 
-    bool validnexthopinNextHopGroup(const NextHopKey&, uint32_t&);
-    bool invalidnexthopinNextHopGroup(const NextHopKey&, uint32_t&);
+    bool validnexthopinNextHopGroup(const NextHopKey&, uint32_t&, bool mux_transition = false, bool local_ref = false);
+    bool invalidnexthopinNextHopGroup(const NextHopKey&, uint32_t&, bool mux_transition = false, bool local_ref = false);
+    bool hasDefaultRouteNextHopGroup(const NextHopKey&) const;
 
     bool createRemoteVtep(sai_object_id_t, const NextHopKey&);
     bool deleteRemoteVtep(sai_object_id_t, const NextHopKey&);
