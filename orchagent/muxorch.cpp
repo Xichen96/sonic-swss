@@ -17,6 +17,7 @@
 #include "orch.h"
 #include "request_parser.h"
 #include "muxorch.h"
+#include "timer.h"
 #include "directory.h"
 #include "swssnet.h"
 #include "crmorch.h"
@@ -545,6 +546,16 @@ bool MuxCable::stateStandby()
 
 bool MuxCable::setState(string new_state)
 {
+    if (st_chg_failed_)
+    {
+        if (std::chrono::steady_clock::now() >= recovery_retry_at_)
+        {
+            rollbackStateChange();
+        }
+        // Finish the retained compensation before processing even a replacement request.
+        return false;
+    }
+
     SWSS_LOG_NOTICE("[%s] Set MUX state from %s to %s", mux_name_.c_str(),
                      muxStateValToString.at(state_).c_str(), new_state.c_str());
 
@@ -552,11 +563,6 @@ bool MuxCable::setState(string new_state)
 
     /* Update new_state to handle unknown state */
     new_state = muxStateValToString.at(ns);
-
-    if (st_chg_failed_)
-    {
-        return false;
-    }
 
     auto it = muxStateTransition.find(make_pair(state_, ns));
     if (it ==  muxStateTransition.end())
@@ -644,13 +650,17 @@ void MuxCable::rollbackStateChange()
         {
             success = refreshSliceRoute();
         }
-        success = nbr_handler_->rollback(prev_state_ == MuxState::MUX_STATE_ACTIVE, tunnel_nh,
-                                        nbr_handler_type_ == MuxNbrHandlerType::NBR_HANDLER_PREFIX_BASED) && success;
-        success = updateRoutes() && success;
+        bool neighbors_restored = nbr_handler_->rollback(prev_state_ == MuxState::MUX_STATE_ACTIVE, tunnel_nh,
+                                        nbr_handler_type_ == MuxNbrHandlerType::NBR_HANDLER_PREFIX_BASED);
+        bool routes_restored = updateRoutes() && success;
         if (slice_route_was_present_ && prev_state_ == MuxState::MUX_STATE_ACTIVE)
         {
-            success = refreshSliceRoute() && success;
+            routes_restored = refreshSliceRoute() && routes_restored;
         }
+        // Multi-MUX routes bypass per-neighbor route updates and may still use an owned local NH.
+        if (prev_state_ != MuxState::MUX_STATE_ACTIVE && routes_restored)
+            neighbors_restored = nbr_handler_->cleanupRollback() && neighbors_restored;
+        success = neighbors_restored && routes_restored;
     }
     catch (const std::exception& e)
     {
@@ -677,11 +687,15 @@ void MuxCable::rollbackStateChange()
     if (success)
     {
         st_chg_failed_ = false;
+        recovery_retry_at_ = {};
+        recovery_retry_delay_ = std::chrono::seconds(1);
         nbr_handler_->commitStateChange();
     }
     else
     {
         st_chg_failed_ = true;
+        recovery_retry_at_ = std::chrono::steady_clock::now() + recovery_retry_delay_;
+        recovery_retry_delay_ = std::min(recovery_retry_delay_ * 2, std::chrono::seconds(30));
         SWSS_LOG_ERROR("[%s] Rollback to %s failed",
                         mux_name_.c_str(), muxStateValToString.at(prev_state_).c_str());
     }
@@ -973,6 +987,7 @@ void MuxNbrHandler::commitStateChange()
 {
     transition_.clear();
     neighbor_contexts_.clear();
+    rollback_blocked_.clear();
 }
 
 void MuxNbrHandler::startRouteUpdate(const IpAddress& ip, bool host_route)
@@ -1065,7 +1080,7 @@ bool MuxNbrHandler::updateNeighborRoutes(const NextHopKey& nh, bool active, bool
 bool MuxNbrHandler::rollback(bool active, sai_object_id_t tunnel_nh, bool prefix_based)
 {
     bool ret = true;
-    std::set<IpAddress> blocked_cleanup;
+    rollback_blocked_.clear();
     if (active)
     {
         ret = gNeighOrch->restoreNeighbors(neighbor_contexts_, true);
@@ -1073,7 +1088,7 @@ bool MuxNbrHandler::rollback(bool active, sai_object_id_t tunnel_nh, bool prefix
     for (auto& entry : transition_)
     {
         auto& progress = entry.second;
-        if (!progress.routes_started && !progress.host_route_started)
+        if (progress.rollback_done || (!progress.routes_started && !progress.host_route_started))
         {
             continue;
         }
@@ -1087,7 +1102,7 @@ bool MuxNbrHandler::rollback(bool active, sai_object_id_t tunnel_nh, bool prefix
             }
             if (target == SAI_NULL_OBJECT_ID)
             {
-                blocked_cleanup.insert(entry.first);
+                rollback_blocked_.insert(entry.first);
                 ret = false;
                 continue;
             }
@@ -1121,30 +1136,37 @@ bool MuxNbrHandler::rollback(bool active, sai_object_id_t tunnel_nh, bool prefix
             restored = !progress.route_result_unknown && restored;
             if (!restored)
             {
-                blocked_cleanup.insert(entry.first);
+                rollback_blocked_.insert(entry.first);
                 ret = false;
+            }
+            else
+            {
+                progress.rollback_done = true;
             }
         }
         catch (const std::exception& e)
         {
             SWSS_LOG_ERROR("MUX route rollback interrupted for %s: %s", key.to_string().c_str(), e.what());
-            blocked_cleanup.insert(entry.first);
+            rollback_blocked_.insert(entry.first);
             ret = false;
         }
     }
-    if (!active)
+    return ret;
+}
+
+bool MuxNbrHandler::cleanupRollback()
+{
+    bool ret = true;
+    for (auto& ctx : neighbor_contexts_)
     {
-        for (auto& ctx : neighbor_contexts_)
+        if (rollback_blocked_.count(ctx.neighborEntry.ip_address))
         {
-            if (blocked_cleanup.count(ctx.neighborEntry.ip_address))
-            {
-                ret = false;
-                continue;
-            }
-            std::list<NeighborContext> restore{ctx};
-            ret = gNeighOrch->restoreNeighbors(restore, false) && ret;
-            ctx = restore.front();
+            ret = false;
+            continue;
         }
+        std::list<NeighborContext> restore{ctx};
+        ret = gNeighOrch->restoreNeighbors(restore, false) && ret;
+        ctx = restore.front();
     }
     return ret;
 }
@@ -1496,6 +1518,11 @@ void MuxNbrHandler::updateTunnelRoute(NextHopKey nh, bool add)
  */
 bool MuxNbrHandler::setBulkRouteNH(std::list<MuxRouteBulkContext>& bulk_ctx_list)
 {
+    struct BulkClearGuard
+    {
+        EntityBulker<sai_route_api_t>& bulker;
+        ~BulkClearGuard() { bulker.clear(); }
+    } clear_on_exit{gRouteBulker};
     sai_status_t status;
     bool ret = true;
 
@@ -1519,7 +1546,21 @@ bool MuxNbrHandler::setBulkRouteNH(std::list<MuxRouteBulkContext>& bulk_ctx_list
         gRouteBulker.set_entry_attribute(&object_statuses.back(), &route_entry, &route_attr);
     }
 
-    gRouteBulker.flush();
+    try
+    {
+        gRouteBulker.flush();
+    }
+    catch (const std::exception& e)
+    {
+        SWSS_LOG_ERROR("MUX prefix route set interrupted: %s", e.what());
+        for (const auto& ctx : bulk_ctx_list)
+        {
+            auto progress = transition_.find(ctx.pfx.getIp());
+            if (progress != transition_.end() && ctx.object_statuses.front() == SAI_STATUS_NOT_EXECUTED)
+                progress->second.host_route_unknown = true;
+        }
+        throw;
+    }
 
     for (auto ctx = bulk_ctx_list.begin(); ctx != bulk_ctx_list.end(); ctx++)
     {
@@ -1535,11 +1576,13 @@ bool MuxNbrHandler::setBulkRouteNH(std::list<MuxRouteBulkContext>& bulk_ctx_list
             continue;
         }
 
+        auto progress = transition_.find(ctx->pfx.getIp());
+        if (progress != transition_.end())
+            progress->second.host_route_unknown = false;
         SWSS_LOG_INFO("Set route to %s, nh %" PRIx64, ctx->pfx.to_string().c_str(),
                 ctx->nh);
     }
 
-    gRouteBulker.clear();
     return ret;
 }
 
@@ -2015,7 +2058,7 @@ bool MuxOrch::updateRoute(const IpPrefix &pfx)
             {
                 SWSS_LOG_ERROR("Failed to set route entry %s to nexthop %s",
                         pfx.to_string().c_str(), neighbor.to_string().c_str());
-                continue;
+                return false;
             }
             SWSS_LOG_NOTICE("setting route %s with nexthop %s %" PRIx64 "",
                 pfx.to_string().c_str(), neighbor.to_string().c_str(), next_hop_id);
@@ -2027,6 +2070,8 @@ bool MuxOrch::updateRoute(const IpPrefix &pfx)
     if (!active_found)
     {
         next_hop_id = getNextHopTunnelId(MUX_TUNNEL, mux_peer_switch_);
+        if (next_hop_id == SAI_NULL_OBJECT_ID)
+            return false;
         /* no active nexthop found, point to first */
         SWSS_LOG_INFO("No Active neighbors found, setting route %s to point to tun",
                     pfx.getIp().to_string().c_str());
@@ -3158,6 +3203,44 @@ MuxCableOrch::MuxCableOrch(DBConnector *db, DBConnector *sdb, const std::string&
               mux_metric_table_(sdb, STATE_MUX_METRICS_TABLE_NAME)
 {
     mux_table_ = unique_ptr<Table>(new Table(db, APP_HW_MUX_CABLE_TABLE_NAME));
+    recovery_timer_ = new swss::SelectableTimer(timespec{1, 0});
+    Orch::addExecutor(new ExecutableTimer(recovery_timer_, this, "MUX_RECOVERY_TIMER"));
+}
+
+void MuxCableOrch::scheduleRecovery(const std::string& port)
+{
+    recovery_ports_.insert(port);
+    if (!recovery_timer_running_)
+    {
+        recovery_timer_->start();
+        recovery_timer_running_ = true;
+    }
+}
+
+void MuxCableOrch::doTask(swss::SelectableTimer&)
+{
+    auto mux_orch = gDirectory.get<MuxOrch*>();
+    for (auto it = recovery_ports_.begin(); it != recovery_ports_.end();)
+    {
+        if (mux_orch->isMuxExists(*it))
+        {
+            auto mux = mux_orch->getMuxCable(*it);
+            if (mux->isStateChangeFailed())
+                mux->setState(mux->getState());
+            if (mux->isStateChangeFailed())
+            {
+                ++it;
+                continue;
+            }
+        }
+        it = recovery_ports_.erase(it);
+    }
+    Orch::doTask();
+    if (recovery_ports_.empty())
+    {
+        recovery_timer_->stop();
+        recovery_timer_running_ = false;
+    }
 }
 
 void MuxCableOrch::updateMuxState(string portName, string muxState)
@@ -3241,11 +3324,24 @@ bool MuxCableOrch::addOperation(const Request& request)
     auto state = request.getAttrString("state");
     auto mux_obj = mux_orch->getMuxCable(port_name);
 
+    auto handle_failure = [&] {
+        if (mux_obj->isStateChangeInProgress() || mux_obj->isStateChangeFailed())
+            mux_obj->rollbackStateChange();
+        if (mux_obj->isStateChangeFailed())
+        {
+            scheduleRecovery(port_name);
+            return false;
+        }
+        // Preserve request consumption after an execution failure was fully compensated.
+        return true;
+    };
     try
     {
         if (!mux_obj->setState(state))
         {
-            // No transition started. Retain the request for a later orchestration cycle.
+            if (mux_obj->isStateChangeFailed())
+                scheduleRecovery(port_name);
+            // No new transition started; any retained compensation still owns its progress.
             return false;
         }
     }
@@ -3253,25 +3349,19 @@ bool MuxCableOrch::addOperation(const Request& request)
     {
         SWSS_LOG_ERROR("Mux Error setting state %s for port %s. Error: %s",
                         state.c_str(), port_name.c_str(), e.what());
-        if (mux_obj->isStateChangeInProgress() || mux_obj->isStateChangeFailed())
-            mux_obj->rollbackStateChange();
-        return true;
+        return handle_failure();
     }
     catch (const std::logic_error& e)
     {
         SWSS_LOG_ERROR("Logic error while setting state %s for port %s. Error: %s",
                         state.c_str(), port_name.c_str(), e.what());
-        if (mux_obj->isStateChangeInProgress() || mux_obj->isStateChangeFailed())
-            mux_obj->rollbackStateChange();
-        return true;
+        return handle_failure();
     }
     catch (const std::exception& e)
     {
         SWSS_LOG_ERROR("Exception caught while setting state %s for port %s. Error: %s",
                         state.c_str(), port_name.c_str(), e.what());
-        if (mux_obj->isStateChangeInProgress() || mux_obj->isStateChangeFailed())
-            mux_obj->rollbackStateChange();
-        return true;
+        return handle_failure();
     }
 
     SWSS_LOG_NOTICE("Mux State set to %s for port %s", state.c_str(), port_name.c_str());

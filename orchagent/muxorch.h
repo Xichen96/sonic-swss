@@ -4,6 +4,8 @@
 #include <unordered_map>
 #include <set>
 #include <memory>
+#include <chrono>
+#include "selectabletimer.h"
 
 #include "request_parser.h"
 #include "portsorch.h"
@@ -106,6 +108,7 @@ public:
     void clearBulkers() { gRouteBulker.clear(); };
     bool prepareStateChange(bool require_local_nh = false);
     bool rollback(bool active, sai_object_id_t tunnel_nh, bool prefix_based);
+    bool cleanupRollback();
     void commitStateChange();
 
 protected:
@@ -132,9 +135,11 @@ protected:
         uint32_t routes_restored = 0;
         bool members_local = false;
         bool route_result_unknown = false;
+        bool rollback_done = false;
     };
     std::map<IpAddress, NeighborProgress> transition_;
     std::list<NeighborContext> neighbor_contexts_;
+    std::set<IpAddress> rollback_blocked_;
     void startRouteUpdate(const IpAddress& ip, bool host_route = false);
     bool updateNeighborRoutes(const NextHopKey& nh, bool active, bool prefix_based, bool restoring = false);
 };
@@ -214,6 +219,8 @@ private:
     MuxState prev_state_ = MuxState::MUX_STATE_INIT;
     bool st_chg_in_progress_ = false;
     bool st_chg_failed_ = false;
+    std::chrono::steady_clock::time_point recovery_retry_at_{};
+    std::chrono::seconds recovery_retry_delay_{1};
 
     IpPrefix srv_ip4_, srv_ip6_;
     IpAddress peer_ip4_;
@@ -431,6 +438,7 @@ public:
 class MuxCableOrch : public Orch2
 {
 public:
+    using Orch2::doTask;
     MuxCableOrch(DBConnector *db, DBConnector *sdb, const std::string& tableName);
 
     void updateMuxState(string portName, string muxState);
@@ -446,6 +454,11 @@ private:
     MuxCableRequest request_;
     swss::Table mux_metric_table_;
     ProducerStateTable app_tunnel_route_table_;
+    swss::SelectableTimer *recovery_timer_ = nullptr; // Owned by its Executor.
+    bool recovery_timer_running_ = false;
+    std::set<std::string> recovery_ports_;
+    void scheduleRecovery(const std::string& port);
+    void doTask(swss::SelectableTimer& timer) override;
 };
 
 const request_description_t mux_state_request_description = {

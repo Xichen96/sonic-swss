@@ -1605,19 +1605,30 @@ bool AclRule::remove()
     return res;
 }
 
-void AclRule::updateInPorts()
+bool AclRule::updateInPorts(const vector<sai_object_id_t>& ports)
 {
     SWSS_LOG_ENTER();
-    sai_status_t status;
-
-    auto attr = m_matches[SAI_ACL_ENTRY_ATTR_FIELD_IN_PORTS].getSaiAttr();
+    auto match = m_matches.find(SAI_ACL_ENTRY_ATTR_FIELD_IN_PORTS);
+    if (match == m_matches.end())
+    {
+        return false;
+    }
+    auto attr = match->second.getSaiAttr();
     attr.value.aclfield.enable = true;
+    attr.value.aclfield.data.objlist.count = static_cast<uint32_t>(ports.size());
+    attr.value.aclfield.data.objlist.list = const_cast<sai_object_id_t*>(ports.data());
+    SaiAttrWrapper updated(SAI_OBJECT_TYPE_ACL_ENTRY, attr);
 
-    status = sai_acl_api->set_acl_entry_attribute(m_ruleOid, &attr);
+    auto status = sai_acl_api->set_acl_entry_attribute(m_ruleOid, &updated.getSaiAttr());
+    m_lastSaiStatus = status;
     if (status != SAI_STATUS_SUCCESS)
     {
         SWSS_LOG_ERROR("Failed to update ACL rule %s, rv:%d", m_id.c_str(), status);
+        return false;
     }
+    // Commit the owned match only after SAI confirms the update.
+    match->second = std::move(updated);
+    return true;
 }
 
 bool AclRule::update(const AclRule& updatedRule)
@@ -5296,7 +5307,6 @@ bool AclOrch::updateAclRule(string table_id, string rule_id, string attr_name, v
     SWSS_LOG_ENTER();
 
     sai_object_id_t table_oid = getTableById(table_id);
-    string attr_value;
 
     if (table_oid == SAI_NULL_OBJECT_ID)
     {
@@ -5317,38 +5327,24 @@ bool AclOrch::updateAclRule(string table_id, string rule_id, string attr_name, v
         {
             sai_object_id_t port_oid = *(sai_object_id_t *)data;
             vector<sai_object_id_t> in_ports = rule_it->second->getInPorts();
+            auto port_iter = std::find(in_ports.begin(), in_ports.end(), port_oid);
 
             if (oper == RULE_OPER_ADD)
             {
+                if (port_iter != in_ports.end())
+                    return true;
+                Port port;
+                if (!gPortsOrch->getPort(port_oid, port))
+                    return false;
                 in_ports.push_back(port_oid);
             }
             else
             {
-                for (auto port_iter = in_ports.begin(); port_iter != in_ports.end(); port_iter++)
-                {
-                    if (*port_iter == port_oid)
-                    {
-                        in_ports.erase(port_iter);
-                        break;
-                    }
-                }
+                if (port_iter == in_ports.end())
+                    return true;
+                in_ports.erase(port_iter);
             }
-
-            for (const auto& port_iter: in_ports)
-            {
-                Port p;
-                gPortsOrch->getPort(port_iter, p);
-                attr_value += p.m_alias;
-                attr_value += ',';
-            }
-
-            if (!attr_value.empty())
-            {
-                attr_value.pop_back();
-            }
-
-            rule_it->second->validateAddMatch(MATCH_IN_PORTS, attr_value);
-            rule_it->second->updateInPorts();
+            return rule_it->second->updateInPorts(in_ports);
         }
         break;
 
