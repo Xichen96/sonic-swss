@@ -15,6 +15,7 @@
 #include "nexthopgroupkey.h"
 
 #include <map>
+#include <functional>
 
 typedef uint32_t Bank;
 typedef uint32_t HashBucketIdx;
@@ -109,8 +110,11 @@ public:
     void update(SubjectType type, void *cntx);
     bool isRouteFineGrained(sai_object_id_t vrf_id, const IpPrefix &ipPrefix, const NextHopGroupKey &nextHops);
     bool syncdContainsFgNhg(sai_object_id_t vrf_id, const IpPrefix &ipPrefix);
-    bool validNextHopInNextHopGroup(const NextHopKey&);
-    bool invalidNextHopInNextHopGroup(const NextHopKey&);
+    std::vector<std::pair<sai_object_id_t, IpPrefix>> getNextHopRoutes(const NextHopKey&) const;
+    bool validNextHopInNextHopGroup(const NextHopKey&,
+        const std::function<bool(sai_object_id_t, const IpPrefix&)>& filter = {});
+    bool invalidNextHopInNextHopGroup(const NextHopKey&,
+        const std::function<bool(sai_object_id_t, const IpPrefix&)>& filter = {});
     bool setFgNhg(sai_object_id_t vrf_id, const IpPrefix &ipPrefix, const NextHopGroupKey &nextHops, sai_object_id_t &next_hop_id, bool &isNextHopIdChanged);
     bool removeFgNhg(sai_object_id_t vrf_id, const IpPrefix &ipPrefix);
 

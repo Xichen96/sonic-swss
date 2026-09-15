@@ -3,6 +3,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <functional>
 #include <map>
 #include <nlohmann/json.hpp>
@@ -2537,7 +2538,11 @@ TEST_F(RouteManagerTest, RouteCreateAndUpdateInDrainSucceeds)
                                                        p4orch::kSetMetadataAndDrop, "", kMetadata1);
     Enqueue(APP_P4RT_IPV4_TABLE_NAME, key_op_fvs_3);
     EXPECT_CALL(mock_sai_route_, set_route_entries_attribute(_, _, _, _, _))
-        .WillRepeatedly(DoAll(SetArrayArgument<4>(exp_status.begin(), exp_status.end()), Return(SAI_STATUS_SUCCESS)));
+        .WillRepeatedly([](uint32_t count, const sai_route_entry_t*, const sai_attribute_t*,
+                           sai_bulk_op_error_mode_t, sai_status_t* statuses) -> sai_status_t {
+            std::fill_n(statuses, count, SAI_STATUS_SUCCESS);
+            return SAI_STATUS_SUCCESS;
+        });
     EXPECT_CALL(publisher_, publish(Eq(APP_P4RT_TABLE_NAME), Eq(kfvKey(key_op_fvs_3)),
                                     FieldValueTupleArrayEq(kfvFieldsValues(key_op_fvs_3)),
                                     Eq(StatusCode::SWSS_RC_SUCCESS), Eq(true)))

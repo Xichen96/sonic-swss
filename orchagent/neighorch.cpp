@@ -1080,7 +1080,10 @@ void NeighOrch::doTask(Consumer &consumer)
             ctx.mac = mac_address;
 
             bool nbr_not_found = (m_syncdNeighbors.find(neighbor_entry) == m_syncdNeighbors.end());
-            if (nbr_not_found || m_syncdNeighbors[neighbor_entry].mac != mac_address)
+            bool repair = !nbr_not_found && m_syncdNeighbors.at(neighbor_entry).hw_configured &&
+                          (getLocalNextHopId(neighbor_entry) == SAI_NULL_OBJECT_ID ||
+                           m_syncdNeighbors.at(neighbor_entry).incarnation->prefix_pending);
+            if (nbr_not_found || m_syncdNeighbors[neighbor_entry].mac != mac_address || repair)
             {
                 if (!mac_address)
                 {
@@ -1232,7 +1235,9 @@ bool NeighOrch::addPrefixRouteForNeighbor(const IpAddress& ip_address, string& a
 
     // if standalone mux route for this neighbor is created, then
     // set the new attributes
-    if (mux_orch->isStandaloneTunnelRouteInstalled(ip_address))
+    auto data = m_syncdNeighbors.find(NeighborEntry(ip_address, alias));
+    if (mux_orch->isStandaloneTunnelRouteInstalled(ip_address) ||
+        (data != m_syncdNeighbors.end() && data->second.incarnation->prefix_owned))
     {
         for (auto& route_attr : rt_attrs)
         {
@@ -1269,6 +1274,8 @@ bool NeighOrch::addPrefixRouteForNeighbor(const IpAddress& ip_address, string& a
         }
     }
 
+    if (data != m_syncdNeighbors.end())
+        data->second.incarnation->prefix_owned = true;
     return true;
 }
 
@@ -1284,7 +1291,7 @@ bool NeighOrch::removePrefixRouteForNeighbor(const IpAddress& ip_address, sai_ob
     subnet(route_entry.destination, route_entry.destination);
 
     sai_status_t status = sai_route_api->remove_route_entry(&route_entry);
-    if (status != SAI_STATUS_SUCCESS)
+    if (status != SAI_STATUS_SUCCESS && status != SAI_STATUS_ITEM_NOT_FOUND)
     {
         SWSS_LOG_ERROR("Failed to delete mux neigh route for %s.", ip_address.to_string().c_str());
         return false;
@@ -1302,6 +1309,20 @@ bool NeighOrch::removePrefixRouteForNeighbor(const IpAddress& ip_address, sai_ob
     }
 
     return true;
+}
+
+void NeighOrch::setNeighborData(const NeighborEntry& entry, const MacAddress& mac,
+                                bool hw_configured, bool prefix_route, bool new_incarnation)
+{
+    auto old = m_syncdNeighbors.find(entry);
+    auto incarnation = old != m_syncdNeighbors.end() && old->second.mac == mac && !new_incarnation
+                     ? old->second.incarnation : std::make_shared<NeighborIncarnation>();
+    if (old != m_syncdNeighbors.end() && old->second.incarnation != incarnation)
+    {
+        incarnation->prefix_owned = prefix_route && old->second.incarnation->prefix_owned;
+        old->second.incarnation->retired = true;
+    }
+    m_syncdNeighbors[entry] = {mac, hw_configured, 0, prefix_route, incarnation};
 }
 
 bool NeighOrch::addNeighbor(NeighborContext& ctx)
@@ -1426,6 +1447,8 @@ bool NeighOrch::addNeighbor(NeighborContext& ctx)
     }
 
     bool hw_config = isHwConfigured(neighborEntry);
+    const bool previous_hw_config = hw_config;
+    const auto previous_next_hop = getLocalNextHopId(neighborEntry);
     /*
      * Prefix-route mode programs neighbors with NO_HOST_ROUTE and controls
      * active/standby forwarding through the explicit host prefix route.  Keep
@@ -1465,7 +1488,7 @@ bool NeighOrch::addNeighbor(NeighborContext& ctx)
         {
             /* The fdb is still in vxlan port, just save neighbor info */
             SWSS_LOG_NOTICE("Mac %s is still in vxlan port, skip hw programming!", macAddress.to_string().c_str());
-            m_syncdNeighbors[neighborEntry] = { macAddress, hw_config, 0, prefix_route };
+            setNeighborData(neighborEntry, macAddress, hw_config, prefix_route);
             return true;
         }
     }
@@ -1521,8 +1544,6 @@ bool NeighOrch::addNeighbor(NeighborContext& ctx)
             gCrmOrch->incCrmResUsedCounter(CrmResourceType::CRM_IPV6_NEIGHBOR);
         }
 
-        auto nhKey = NextHopKey(ip_address, alias);
-
         if (!addNextHop(ctx))
         {
             status = sai_neighbor_api->remove_neighbor_entry(&neighbor_entry);
@@ -1550,16 +1571,6 @@ bool NeighOrch::addNeighbor(NeighborContext& ctx)
             return false;
         }
 
-        // full prefix route pointing to neighbor nh
-        if (prefix_route)
-        {
-            sai_object_id_t next_hop_id = m_syncdNextHops[nhKey].next_hop_id;
-            if (!addPrefixRouteForNeighbor(ip_address, alias, next_hop_id, is_nbr_active))
-            {
-                return false;
-            }
-        }
-
         hw_config = true;
     }
     else if (isHwConfigured(neighborEntry))
@@ -1581,7 +1592,20 @@ bool NeighOrch::addNeighbor(NeighborContext& ctx)
         SWSS_LOG_NOTICE("Updated neighbor %s on %s", macAddress.to_string().c_str(), alias.c_str());
     }
 
-    m_syncdNeighbors[neighborEntry] = { macAddress, hw_config, 0, prefix_route };
+    if (!bulk_op && hw_config && getLocalNextHopId(neighborEntry) == SAI_NULL_OBJECT_ID && !addNextHop(ctx))
+        return false;
+    setNeighborData(neighborEntry, macAddress, hw_config, prefix_route,
+                    !bulk_op && (previous_hw_config != hw_config ||
+                                 previous_next_hop != getLocalNextHopId(neighborEntry)));
+    if (hw_config && prefix_route)
+    {
+        auto incarnation = m_syncdNeighbors.at(neighborEntry).incarnation;
+        // Preserve primary-object ownership even if its dependent route must be retried.
+        incarnation->prefix_pending = true;
+        if (!addPrefixRouteForNeighbor(ip_address, alias, getLocalNextHopId(neighborEntry), is_nbr_active))
+            return false;
+        incarnation->prefix_pending = false;
+    }
 
     NeighborUpdate update = { neighborEntry, macAddress, true };
     notify(SUBJECT_TYPE_NEIGH_CHANGE, static_cast<void *>(&update));
@@ -1647,21 +1671,36 @@ bool NeighOrch::removeNeighbor(NeighborContext& ctx, bool disable)
         return false;
     }
 
-    if (isHwConfigured(neighborEntry) && !disable)
+    if (!bulk_op)
     {
-        NeighborUpdate update = { neighborEntry, MacAddress(), false };
-        notify(SUBJECT_TYPE_NEIGH_CHANGE, static_cast<void *>(&update));
+        if (neighborIt->second.hw_configured && neighborIt->second.prefix_route)
+        {
+            if (neighborIt->second.incarnation->prefix_owned &&
+                !removePrefixRouteForNeighbor(ip_address, port_vrf_id))
+                return false;
+            neighborIt->second.incarnation->prefix_owned = false;
+            neighborIt->second.incarnation->prefix_pending = true;
+        }
+        auto local = m_syncdNextHops.find(nexthop);
+        if (local != m_syncdNextHops.end())
+        {
+            status = sai_next_hop_api->remove_next_hop(local->second.next_hop_id);
+            if (status != SAI_STATUS_SUCCESS && status != SAI_STATUS_ITEM_NOT_FOUND)
+            {
+                task_process_status handle_status = handleSaiRemoveStatus(SAI_API_NEXT_HOP, status);
+                if (handle_status != task_success)
+                    return parseHandleSaiStatusFailure(handle_status);
+            }
+            if (!removeNextHop(ip_address, alias))
+                return false;
+            gCrmOrch->decCrmResUsedCounter(ip_address.isV4()
+                ? CrmResourceType::CRM_IPV4_NEXTHOP : CrmResourceType::CRM_IPV6_NEXTHOP);
+        }
     }
 
     if (isHwConfigured(neighborEntry))
     {
         sai_object_id_t rif_id = m_intfsOrch->getRouterIntfsId(alias);
-
-        // remove the full prefix route
-        if (m_syncdNeighbors[neighborEntry].prefix_route)
-        {
-            removePrefixRouteForNeighbor(ip_address, port_vrf_id);
-        }
 
         sai_neighbor_entry_t neighbor_entry;
         neighbor_entry.rif_id = rif_id;
@@ -1684,42 +1723,6 @@ bool NeighOrch::removeNeighbor(NeighborContext& ctx, bool disable)
             return true;
         }
 
-        status = sai_next_hop_api->remove_next_hop(next_hop_id);
-        if (status != SAI_STATUS_SUCCESS)
-        {
-            /* When next hop is not found, we continue to remove neighbor entry. */
-            if (status == SAI_STATUS_ITEM_NOT_FOUND)
-            {
-                SWSS_LOG_NOTICE("Next hop %s on %s doesn't exist, rv:%d",
-                               ip_address.to_string().c_str(), alias.c_str(), status);
-            }
-            else
-            {
-                SWSS_LOG_ERROR("Failed to remove next hop %s on %s, rv:%d",
-                               ip_address.to_string().c_str(), alias.c_str(), status);
-                task_process_status handle_status = handleSaiRemoveStatus(SAI_API_NEXT_HOP, status);
-                if (handle_status != task_success)
-                {
-                    return parseHandleSaiStatusFailure(handle_status);
-                }
-            }
-        }
-
-        if (status != SAI_STATUS_ITEM_NOT_FOUND)
-        {
-            if (neighbor_entry.ip_address.addr_family == SAI_IP_ADDR_FAMILY_IPV4)
-            {
-                gCrmOrch->decCrmResUsedCounter(CrmResourceType::CRM_IPV4_NEXTHOP);
-            }
-            else
-            {
-                gCrmOrch->decCrmResUsedCounter(CrmResourceType::CRM_IPV6_NEXTHOP);
-            }
-        }
-
-        SWSS_LOG_NOTICE("Removed next hop %s on %s",
-                        ip_address.to_string().c_str(), alias.c_str());
-
         status = sai_neighbor_api->remove_neighbor_entry(&neighbor_entry);
         if (status != SAI_STATUS_SUCCESS)
         {
@@ -1739,23 +1742,10 @@ bool NeighOrch::removeNeighbor(NeighborContext& ctx, bool disable)
                 }
             }
         }
-        else
-        {
-            if (neighbor_entry.ip_address.addr_family == SAI_IP_ADDR_FAMILY_IPV4)
-            {
-                gCrmOrch->decCrmResUsedCounter(CrmResourceType::CRM_IPV4_NEIGHBOR);
-            }
-            else
-            {
-                gCrmOrch->decCrmResUsedCounter(CrmResourceType::CRM_IPV6_NEIGHBOR);
-            }
-
-            removeNextHop(ip_address, alias);
-            m_intfsOrch->decreaseRouterIntfsRefCount(alias);
-            SWSS_LOG_NOTICE("Removed neighbor %s on %s",
-                    m_syncdNeighbors[neighborEntry].mac.to_string().c_str(), alias.c_str());
-        }
-
+        gCrmOrch->decCrmResUsedCounter(ip_address.isV4()
+            ? CrmResourceType::CRM_IPV4_NEIGHBOR : CrmResourceType::CRM_IPV6_NEIGHBOR);
+        m_intfsOrch->decreaseRouterIntfsRefCount(alias);
+        neighborIt->second.hw_configured = false;
     }
 
     /* Do not delete entry from cache if its disable request */
@@ -1765,6 +1755,7 @@ bool NeighOrch::removeNeighbor(NeighborContext& ctx, bool disable)
         return true;
     }
 
+    neighborIt->second.incarnation->retired = true;
     m_syncdNeighbors.erase(neighborEntry);
 
     NeighborUpdate update = { neighborEntry, MacAddress(), false };
@@ -1956,6 +1947,7 @@ bool NeighOrch::enableNeighbors(std::list<NeighborContext>& bulk_ctx_list)
             continue;
         }
         ctx->mac = neighborIt->second.mac;
+        ctx->incarnation = neighborIt->second.incarnation;
 
         if (isHwConfigured(neighborEntry) && getLocalNextHopId(neighborEntry) != SAI_NULL_OBJECT_ID)
         {
@@ -2035,6 +2027,7 @@ bool NeighOrch::disableNeighbors(std::list<NeighborContext>& bulk_ctx_list)
             continue;
         }
         ctx->mac = neighborIt->second.mac;
+        ctx->incarnation = neighborIt->second.incarnation;
 
         SWSS_LOG_NOTICE("Neighbor disable request for %s ", neighborEntry.ip_address.to_string().c_str());
 
@@ -2096,6 +2089,22 @@ bool NeighOrch::restoreNeighbors(std::list<NeighborContext>& contexts, bool acti
     bool ret = true;
     for (auto& ctx : contexts)
     {
+        if (ctx.incarnation && ctx.incarnation->retired)
+        {
+            // Retirement settles known ownership, not an unacknowledged SDK outcome.
+            ctx.neighbor_created = ctx.nexthop_created = false;
+            ctx.neighbor_removed = ctx.nexthop_removed = false;
+            ret = !ctx.result_unknown && ret;
+            continue;
+        }
+        auto current = m_syncdNeighbors.find(ctx.neighborEntry);
+        if ((ctx.neighbor_created || ctx.nexthop_created || ctx.neighbor_removed || ctx.nexthop_removed) &&
+            (!ctx.incarnation || current == m_syncdNeighbors.end() ||
+             current->second.incarnation != ctx.incarnation))
+        {
+            ret = false;
+            continue;
+        }
         ret = !ctx.result_unknown && ret;
         try
         {
@@ -2120,7 +2129,8 @@ bool NeighOrch::restoreNeighbors(std::list<NeighborContext>& contexts, bool acti
             if (ctx.nexthop_created)
             {
                 auto nh = m_syncdNextHops.find(ctx.neighborEntry);
-                if (nh != m_syncdNextHops.end() && nh->second.ref_count != 0)
+                if (nh != m_syncdNextHops.end() &&
+                    (nh->second.next_hop_id != ctx.next_hop_id || nh->second.ref_count != 0))
                 {
                     ret = false;
                     continue;
@@ -2157,13 +2167,13 @@ bool NeighOrch::restoreNeighbors(std::list<NeighborContext>& contexts, bool acti
                     continue;
                 }
                 auto neighbor = m_syncdNeighbors.find(ctx.neighborEntry);
-                if (neighbor != m_syncdNeighbors.end())
+                if (neighbor != m_syncdNeighbors.end() && neighbor->second.hw_configured)
                 {
                     neighbor->second.hw_configured = false;
+                    m_intfsOrch->decreaseRouterIntfsRefCount(ctx.neighborEntry.alias);
+                    gCrmOrch->decCrmResUsedCounter(ctx.neighborEntry.ip_address.isV4()
+                        ? CrmResourceType::CRM_IPV4_NEIGHBOR : CrmResourceType::CRM_IPV6_NEIGHBOR);
                 }
-                m_intfsOrch->decreaseRouterIntfsRefCount(ctx.neighborEntry.alias);
-                gCrmOrch->decCrmResUsedCounter(ctx.neighborEntry.ip_address.isV4()
-                    ? CrmResourceType::CRM_IPV4_NEIGHBOR : CrmResourceType::CRM_IPV6_NEIGHBOR);
                 ctx.neighbor_created = false;
             }
         }
@@ -2955,7 +2965,7 @@ bool NeighOrch::addZeroMacTunnelRoute(const NeighborEntry& entry, const MacAddre
     mux_orch->update(SUBJECT_TYPE_NEIGH_CHANGE, static_cast<void *>(&update));
     if (mux_orch->isStandaloneTunnelRouteInstalled(entry.ip_address))
     {
-        m_syncdNeighbors[entry] = { mac, false };
+        setNeighborData(entry, mac, false, false);
         return true;
     }
 

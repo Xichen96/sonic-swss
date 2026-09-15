@@ -40,6 +40,7 @@ struct NextHopGroupEntry
     sai_object_id_t         next_hop_group_id;      // next hop group id
     int                     ref_count;              // reference count
     NextHopGroupMembers     nhopgroup_members;      // ids of members indexed by <ip_address, if_alias>
+    uint64_t generation = 0;
 };
 
 struct NextHopUpdate
@@ -58,6 +59,8 @@ struct NextHopUpdate
 struct RouteNhg
 {
     NextHopGroupKey nhg_key;
+    uint64_t generation = 0;
+    bool mux_ref_released = false;
 
     /*
      * Index of the next hop group used.  Filled only if referencing a
@@ -87,6 +90,9 @@ struct RouteKey
         return (vrf_id <= rhs.vrf_id && prefix < rhs.prefix);
     }
 };
+
+using MuxRouteJournal = std::map<std::pair<sai_object_id_t, IpPrefix>, std::pair<uint64_t, bool>>;
+using MuxNextHopGroups = std::map<NextHopGroupKey, uint64_t>;
 
 /* NextHopGroupTable: NextHopGroupKey, NextHopGroupEntry */
 typedef std::map<NextHopGroupKey, NextHopGroupEntry> NextHopGroupTable;
@@ -202,11 +208,16 @@ public:
     void addNextHopRoute(const NextHopKey&, const RouteKey&);
     void removeNextHopRoute(const NextHopKey&, const RouteKey&);
     bool updateNextHopRoutes(const NextHopKey&, uint32_t&, bool mux_transition = false);
+    bool updateMuxNextHopRoutes(const NextHopKey&, MuxRouteJournal&, bool restoring);
+    bool reconcileMuxNextHopRoutes(const NextHopKey&);
+    MuxNextHopGroups getMuxNextHopGroups(const NextHopKey&) const;
     bool getRoutesForNexthop(std::set<RouteKey>&, const NextHopKey&);
 
-    bool validnexthopinNextHopGroup(const NextHopKey&, uint32_t&, bool mux_transition = false, bool local_ref = false);
-    bool invalidnexthopinNextHopGroup(const NextHopKey&, uint32_t&, bool mux_transition = false, bool local_ref = false);
-    bool hasDefaultRouteNextHopGroup(const NextHopKey&) const;
+    bool validnexthopinNextHopGroup(const NextHopKey&, uint32_t&, bool mux_transition = false, bool local_ref = false,
+                                   const MuxNextHopGroups* groups = nullptr, const MuxRouteJournal* fg_routes = nullptr);
+    bool invalidnexthopinNextHopGroup(const NextHopKey&, uint32_t&, bool mux_transition = false, bool local_ref = false,
+                                     const MuxNextHopGroups* groups = nullptr, const MuxRouteJournal* fg_routes = nullptr);
+    bool hasDefaultRouteNextHopGroup(const NextHopKey&, const MuxNextHopGroups* groups = nullptr) const;
 
     bool createRemoteVtep(sai_object_id_t, const NextHopKey&);
     bool deleteRemoteVtep(sai_object_id_t, const NextHopKey&);
