@@ -3,6 +3,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <string>
 
 #include "mock_response_publisher.h"
@@ -102,6 +103,27 @@ class P4OrchTest : public ::testing::Test {
     sai_route_api->remove_route_entries = remove_route_entries;
     sai_route_api->set_route_entries_attribute = set_route_entries_attribute;
     sai_route_api->get_route_entries_attribute = get_route_entries_attribute;
+    // Successful bulk calls must populate every per-object result.
+    ON_CALL(mock_sai_route_, create_route_entries(_, _, _, _, _, _))
+        .WillByDefault([](uint32_t count, const sai_route_entry_t*,
+                          const uint32_t*, const sai_attribute_t**,
+                          sai_bulk_op_error_mode_t, sai_status_t* statuses) -> sai_status_t {
+          std::fill_n(statuses, count, SAI_STATUS_SUCCESS);
+          return SAI_STATUS_SUCCESS;
+        });
+    ON_CALL(mock_sai_route_, remove_route_entries(_, _, _, _))
+        .WillByDefault([](uint32_t count, const sai_route_entry_t*,
+                          sai_bulk_op_error_mode_t, sai_status_t* statuses) -> sai_status_t {
+          std::fill_n(statuses, count, SAI_STATUS_SUCCESS);
+          return SAI_STATUS_SUCCESS;
+        });
+    ON_CALL(mock_sai_route_, set_route_entries_attribute(_, _, _, _, _))
+        .WillByDefault([](uint32_t count, const sai_route_entry_t*,
+                          const sai_attribute_t*, sai_bulk_op_error_mode_t,
+                          sai_status_t* statuses) -> sai_status_t {
+          std::fill_n(statuses, count, SAI_STATUS_SUCCESS);
+          return SAI_STATUS_SUCCESS;
+        });
     mock_sai_ipmc_group = &mock_sai_ipmc_group_;
     sai_ipmc_group_api->create_ipmc_group = mock_create_ipmc_group;
     sai_ipmc_group_api->remove_ipmc_group = mock_remove_ipmc_group;

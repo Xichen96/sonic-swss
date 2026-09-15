@@ -13,6 +13,7 @@
 #include "schema.h"
 #include "bfdorch.h"
 #include "bulker.h"
+#include <memory>
 
 #define NHFLAGS_IFDOWN                  0x1 // nexthop's outbound i/f is down
 
@@ -25,12 +26,20 @@ struct NextHopEntry
     uint32_t            nh_flags;       // flags
 };
 
+struct NeighborIncarnation
+{
+    bool retired = false;
+    bool prefix_owned = false;
+    bool prefix_pending = false;
+};
+
 struct NeighborData
 {
     MacAddress    mac;
     bool          hw_configured = false; // False means, entry is not written to HW
     uint32_t      voq_encap_index = 0;
     bool          prefix_route = false; // True means full prefix route is created for this neighbor
+    std::shared_ptr<NeighborIncarnation> incarnation = std::make_shared<NeighborIncarnation>();
 };
 
 /* NeighborTable: NeighborEntry, neighbor MAC address */
@@ -62,6 +71,7 @@ struct NeighborContext
     bool                                neighbor_removed = false;
     bool                                nexthop_removed = false;
     bool                                result_unknown = false;
+    std::shared_ptr<NeighborIncarnation> incarnation;
 
     NeighborContext(NeighborEntry neighborEntry)
         : neighborEntry(neighborEntry)
@@ -151,6 +161,8 @@ private:
     bool processBulkAddNextHop(NeighborContext&);
 
     bool addNeighbor(NeighborContext& ctx);
+    void setNeighborData(const NeighborEntry&, const MacAddress&, bool hw_configured, bool prefix_route,
+                         bool new_incarnation = false);
     bool removeNeighbor(NeighborContext& ctx, bool disable = false);
     bool processBulkEnableNeighbor(NeighborContext& ctx);
     bool processBulkDisableNeighbor(NeighborContext& ctx);

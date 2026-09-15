@@ -125,17 +125,17 @@ protected:
     struct NeighborProgress
     {
         sai_object_id_t nexthop;
-        int ref_count;
         bool routes_started = false;
+        bool groups_started = false;
         bool host_route_started = false;
         bool host_route_created = false;
         bool host_route_removed = false;
         bool host_route_unknown = false;
-        uint32_t routes_changed = 0;
-        uint32_t routes_restored = 0;
-        bool members_local = false;
+        std::map<std::pair<sai_object_id_t, IpPrefix>, std::pair<uint64_t, bool>> routes;
+        std::map<NextHopGroupKey, uint64_t> groups;
         bool route_result_unknown = false;
         bool rollback_done = false;
+        std::shared_ptr<NeighborIncarnation> incarnation;
     };
     std::map<IpAddress, NeighborProgress> transition_;
     std::list<NeighborContext> neighbor_contexts_;
@@ -193,10 +193,7 @@ public:
 
     // Slice supernet route tracking (see refreshSliceRoute in muxorch.cpp).
     bool refreshSliceRoute();
-    sai_object_id_t getNextHopId(const NextHopKey nh)
-    {
-        return nbr_handler_->getNextHopId(nh);
-    }
+    sai_object_id_t getNextHopId(const NextHopKey nh);
 
     MuxNbrHandlerType getNbrHandlerType() const
     {

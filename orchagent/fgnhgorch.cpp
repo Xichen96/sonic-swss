@@ -375,7 +375,18 @@ bool FgNhgOrch::modifyRoutesNextHopId(sai_object_id_t vrf_id, const IpPrefix &ip
 }
 
 
-bool FgNhgOrch::validNextHopInNextHopGroup(const NextHopKey& nexthop)
+std::vector<std::pair<sai_object_id_t, IpPrefix>> FgNhgOrch::getNextHopRoutes(const NextHopKey& nexthop) const
+{
+    std::vector<std::pair<sai_object_id_t, IpPrefix>> routes;
+    for (const auto& table : m_syncdFGRouteTables)
+        for (const auto& route : table.second)
+            if (route.second.nhg_key.contains(nexthop))
+                routes.emplace_back(table.first, route.first);
+    return routes;
+}
+
+bool FgNhgOrch::validNextHopInNextHopGroup(const NextHopKey& nexthop,
+    const std::function<bool(sai_object_id_t, const IpPrefix&)>& filter)
 {
     SWSS_LOG_ENTER();
 
@@ -383,6 +394,8 @@ bool FgNhgOrch::validNextHopInNextHopGroup(const NextHopKey& nexthop)
     {
         for (auto &route_table : route_tables.second)
         {
+            if (filter && !filter(route_tables.first, route_table.first))
+                continue;
             if (!(route_table.second.nhg_key.contains(nexthop)))
             {
                 continue;
@@ -412,7 +425,7 @@ bool FgNhgOrch::validNextHopInNextHopGroup(const NextHopKey& nexthop)
             if (syncd_fg_route_entry->active_nexthops.find(nexthop) !=
                     syncd_fg_route_entry->active_nexthops.end())
             {
-                return true;
+                continue;
             }
 
             if (fgNhgEntry->hash_bucket_indices.size() == 0 && syncd_fg_route_entry->points_to_rif)
@@ -487,7 +500,8 @@ bool FgNhgOrch::validNextHopInNextHopGroup(const NextHopKey& nexthop)
 }
 
 
-bool FgNhgOrch::invalidNextHopInNextHopGroup(const NextHopKey& nexthop)
+bool FgNhgOrch::invalidNextHopInNextHopGroup(const NextHopKey& nexthop,
+    const std::function<bool(sai_object_id_t, const IpPrefix&)>& filter)
 {
     SWSS_LOG_ENTER();
 
@@ -495,6 +509,8 @@ bool FgNhgOrch::invalidNextHopInNextHopGroup(const NextHopKey& nexthop)
     {
         for (auto &route_table : route_tables.second)
         {
+            if (filter && !filter(route_tables.first, route_table.first))
+                continue;
             if (!(route_table.second.nhg_key.contains(nexthop)))
             {
                 continue;
@@ -526,7 +542,7 @@ bool FgNhgOrch::invalidNextHopInNextHopGroup(const NextHopKey& nexthop)
             if (syncd_fg_route_entry->active_nexthops.find(nexthop) ==
                     syncd_fg_route_entry->active_nexthops.end())
             {
-                return true;
+                continue;
             }
 
             for (auto active_nh : syncd_fg_route_entry->active_nexthops)

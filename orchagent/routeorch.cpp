@@ -449,17 +449,21 @@ bool RouteOrch::addDefaultRouteNexthopsInNextHopGroup(NextHopGroupEntry& origina
     return true;
 }
 
-bool RouteOrch::hasDefaultRouteNextHopGroup(const NextHopKey& nexthop) const
+bool RouteOrch::hasDefaultRouteNextHopGroup(const NextHopKey& nexthop, const MuxNextHopGroups* groups) const
 {
     for (const auto& group : m_syncdNextHopGroups)
     {
+        if (groups && (groups->find(group.first) == groups->end() ||
+                       groups->at(group.first) != group.second.generation))
+            continue;
         if (group.first.contains(nexthop) && group.second.is_default_route_nh_swap)
             return true;
     }
     return false;
 }
 
-bool RouteOrch::validnexthopinNextHopGroup(const NextHopKey &nexthop, uint32_t& count, bool mux_transition, bool local_ref)
+bool RouteOrch::validnexthopinNextHopGroup(const NextHopKey &nexthop, uint32_t& count, bool mux_transition, bool local_ref,
+                                         const MuxNextHopGroups* groups, const MuxRouteJournal* fg_routes)
 {
     SWSS_LOG_ENTER();
 
@@ -470,7 +474,9 @@ bool RouteOrch::validnexthopinNextHopGroup(const NextHopKey &nexthop, uint32_t& 
     for (auto nhopgroup = m_syncdNextHopGroups.begin();
          nhopgroup != m_syncdNextHopGroups.end(); ++nhopgroup)
     {
-
+        if (groups && (groups->find(nhopgroup->first) == groups->end() ||
+                       groups->at(nhopgroup->first) != nhopgroup->second.generation))
+            continue;
         if (!(nhopgroup->first.contains(nexthop)))
         {
             continue;
@@ -544,7 +550,8 @@ bool RouteOrch::validnexthopinNextHopGroup(const NextHopKey &nexthop, uint32_t& 
             }
         }
 
-        ++count;
+        if (!mux_transition || (local_ref && member.mux_ref_released))
+            ++count;
         gCrmOrch->incCrmResUsedCounter(CrmResourceType::CRM_NEXTHOP_GROUP_MEMBER);
         nhopgroup->second.nhopgroup_members[nexthop].next_hop_id = nexthop_id;
         if (mux_transition)
@@ -554,7 +561,9 @@ bool RouteOrch::validnexthopinNextHopGroup(const NextHopKey &nexthop, uint32_t& 
         nhopgroup->second.nh_member_install_count++;
     }
 
-    if (!m_fgNhgOrch->validNextHopInNextHopGroup(nexthop))
+    auto filter = groups || fg_routes ? muxFgRouteFilter(fg_routes)
+                                    : std::function<bool(sai_object_id_t, const IpPrefix&)>{};
+    if (!m_fgNhgOrch->validNextHopInNextHopGroup(nexthop, filter))
     {
         return false;
     }
@@ -562,7 +571,8 @@ bool RouteOrch::validnexthopinNextHopGroup(const NextHopKey &nexthop, uint32_t& 
     return true;
 }
 
-bool RouteOrch::invalidnexthopinNextHopGroup(const NextHopKey &nexthop, uint32_t& count, bool mux_transition, bool local_ref)
+bool RouteOrch::invalidnexthopinNextHopGroup(const NextHopKey &nexthop, uint32_t& count, bool mux_transition, bool,
+                                           const MuxNextHopGroups* groups, const MuxRouteJournal* fg_routes)
 {
     SWSS_LOG_ENTER();
 
@@ -573,7 +583,9 @@ bool RouteOrch::invalidnexthopinNextHopGroup(const NextHopKey &nexthop, uint32_t
     for (auto nhopgroup = m_syncdNextHopGroups.begin();
          nhopgroup != m_syncdNextHopGroups.end(); ++nhopgroup)
     {
-
+        if (groups && (groups->find(nhopgroup->first) == groups->end() ||
+                       groups->at(nhopgroup->first) != nhopgroup->second.generation))
+            continue;
         if (!(nhopgroup->first.contains(nexthop)))
         {
             continue;
@@ -592,7 +604,7 @@ bool RouteOrch::invalidnexthopinNextHopGroup(const NextHopKey &nexthop, uint32_t
         if (nexthop_id == SAI_NULL_OBJECT_ID)
         {
             // Interface-down removes hardware members but retains logical references.
-            if (mux_transition && local_ref && !member.mux_ref_released)
+            if (mux_transition && !member.mux_ref_released)
                 ++count;
             if (mux_transition)
                 member.mux_ref_released = true;
@@ -636,14 +648,16 @@ bool RouteOrch::invalidnexthopinNextHopGroup(const NextHopKey &nexthop, uint32_t
                 addDefaultRouteNexthopsInNextHopGroup(nhopgroup->second, v6_active_default_route_nhops);
             }
         }
-        if (!mux_transition || !local_ref || !member.mux_ref_released)
+        if (!mux_transition || !member.mux_ref_released)
             ++count;
         if (mux_transition)
             member.mux_ref_released = true;
         gCrmOrch->decCrmResUsedCounter(CrmResourceType::CRM_NEXTHOP_GROUP_MEMBER);
     }
 
-    if (!m_fgNhgOrch->invalidNextHopInNextHopGroup(nexthop))
+    auto filter = groups || fg_routes ? muxFgRouteFilter(fg_routes)
+                                    : std::function<bool(sai_object_id_t, const IpPrefix&)>{};
+    if (!m_fgNhgOrch->invalidNextHopInNextHopGroup(nexthop, filter))
     {
         return false;
     }
@@ -1714,12 +1728,15 @@ bool RouteOrch::addNextHopGroup(const NextHopGroupKey &nexthops)
     {
         m_neighOrch->increaseNextHopRefCount(it);
     }
+    for (const auto& nh : nexthops.getNextHops())
+        next_hop_group_entry.nhopgroup_members[nh].mux_ref_released = !valid_next_hops_for_refcount.count(nh);
 
     /*
      * Initialize the next hop group structure with ref_count as 0. This
      * count will increase once the route is successfully syncd.
      */
     next_hop_group_entry.ref_count = 0;
+    next_hop_group_entry.generation = ++m_muxGeneration;
     m_syncdNextHopGroups[nexthops] = next_hop_group_entry;
 
     return true;
@@ -1926,68 +1943,197 @@ void RouteOrch::removeNextHopRoute(const NextHopKey& nextHop, const RouteKey& ro
     }
 }
 
-bool RouteOrch::updateNextHopRoutes(const NextHopKey& nextHop, uint32_t& numRoutes, bool mux_transition)
+std::function<bool(sai_object_id_t, const IpPrefix&)> RouteOrch::muxFgRouteFilter(const MuxRouteJournal* routes) const
+{
+    return [this, routes](sai_object_id_t vrf, const IpPrefix& prefix) {
+        if (!routes)
+            return false;
+        auto saved = routes->find(std::make_pair(vrf, prefix));
+        auto table = m_syncdRoutes.find(vrf);
+        return saved != routes->end() && table != m_syncdRoutes.end() &&
+               table->second.find(prefix) != table->second.end() &&
+               table->second.at(prefix).generation == saved->second.first;
+    };
+}
+
+bool RouteOrch::isMuxRouteRefReleased(const NextHopGroupKey& group) const
+{
+    if (group.getSize() != 1 || group.is_overlay_nexthop() || group.is_srv6_nexthop())
+        return false;
+    const auto& nh = *group.getNextHops().begin();
+    auto mux = gDirectory.get<MuxOrch*>();
+    if (!mux || nh.isIntfNextHop() || mux->getNexthopMuxName(nh).empty())
+        return false;
+    auto local = m_neighOrch->getLocalNextHopId(nh);
+    return local == SAI_NULL_OBJECT_ID || m_neighOrch->getNextHopId(nh) != local;
+}
+
+bool RouteOrch::setMuxRouteNextHop(const NextHopKey& nh, const RouteKey& key, sai_object_id_t target)
+{
+    if (target == SAI_NULL_OBJECT_ID)
+        return false;
+    auto table = m_syncdRoutes.find(key.vrf_id);
+    if (table == m_syncdRoutes.end())
+        return false;
+    auto route = table->second.find(key.prefix);
+    if (route == table->second.end() || route->second.nhg_key.getSize() != 1 ||
+        !route->second.nhg_key.contains(nh))
+        return false;
+
+    sai_route_entry_t entry{};
+    entry.switch_id = gSwitchId;
+    entry.vr_id = key.vrf_id;
+    copy(entry.destination, key.prefix);
+    sai_attribute_t attr{};
+    attr.id = SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID;
+    attr.value.oid = target;
+    auto status = sai_route_api->set_route_entry_attribute(&entry, &attr);
+    if (status != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_ERROR("Failed to update MUX route %s, rv:%d", key.prefix.to_string().c_str(), status);
+        return false;
+    }
+
+    bool local = target == m_neighOrch->getLocalNextHopId(nh);
+    if (local && route->second.mux_ref_released)
+        m_neighOrch->increaseNextHopRefCount(nh);
+    else if (!local && !route->second.mux_ref_released)
+        m_neighOrch->decreaseNextHopRefCount(nh);
+    route->second.mux_ref_released = !local;
+    return true;
+}
+
+bool RouteOrch::updateNextHopRoutes(const NextHopKey& nextHop, uint32_t& numRoutes, bool)
 {
     numRoutes = 0;
-    auto it = m_nextHops.find((nextHop));
-
-    if (it == m_nextHops.end())
+    auto routes = m_nextHops.find(nextHop);
+    if (routes == m_nextHops.end())
+        return true;
+    for (const auto& key : routes->second)
     {
-        SWSS_LOG_INFO("No routes found for NH %s", nextHop.ip_address.to_string().c_str());
+        if (getSyncdRouteNhgKey(key.vrf_id, key.prefix).getSize() != 1 ||
+            m_fgNhgOrch->syncdContainsFgNhg(key.vrf_id, key.prefix))
+            continue;
+        if (!setMuxRouteNextHop(nextHop, key, m_neighOrch->getNextHopId(nextHop)))
+            return false;
+        ++numRoutes;
+    }
+    return true;
+}
+
+bool RouteOrch::updateMuxNextHopRoutes(const NextHopKey& nh, MuxRouteJournal& journal, bool restoring)
+{
+    if (!restoring)
+    {
+        // Mixed FG groups are not necessarily present in the ordinary MUX route index.
+        for (const auto& key : m_fgNhgOrch->getNextHopRoutes(nh))
+        {
+            auto table = m_syncdRoutes.find(key.first);
+            if (table != m_syncdRoutes.end() && table->second.count(key.second))
+            {
+                const auto& route = table->second.at(key.second);
+                journal.emplace(key, std::make_pair(route.generation, !route.mux_ref_released));
+            }
+        }
+        auto routes = m_nextHops.find(nh);
+        if (routes == m_nextHops.end())
+            return true;
+        for (const auto& key : routes->second)
+        {
+            auto table = m_syncdRoutes.find(key.vrf_id);
+            if (table == m_syncdRoutes.end() || table->second.find(key.prefix) == table->second.end())
+                continue;
+            auto& route = table->second.at(key.prefix);
+            bool fg = m_fgNhgOrch->syncdContainsFgNhg(key.vrf_id, key.prefix);
+            if (!fg && route.nhg_key.getSize() != 1)
+                continue;
+            journal.emplace(std::make_pair(key.vrf_id, key.prefix),
+                            std::make_pair(route.generation, !route.mux_ref_released));
+            if (fg)
+                continue;
+            try
+            {
+                if (!setMuxRouteNextHop(nh, key, m_neighOrch->getNextHopId(nh)))
+                    return false;
+            }
+            catch (const std::exception& e)
+            {
+                SWSS_LOG_ERROR("MUX route update interrupted for %s: %s", key.prefix.to_string().c_str(), e.what());
+                return false;
+            }
+        }
         return true;
     }
 
-    sai_route_entry_t route_entry;
-    sai_attribute_t route_attr;
-    sai_object_id_t next_hop_id;
-
-    auto rt = it->second.begin();
-    while(rt != it->second.end())
+    bool ret = true;
+    for (auto it = journal.begin(); it != journal.end();)
     {
-        /* Check if route points to nexthop group and skip */
-        NextHopGroupKey nhg_key = gRouteOrch->getSyncdRouteNhgKey(gVirtualRouterId, (*rt).prefix);
-        if (nhg_key.getSize() > 1)
+        auto table = m_syncdRoutes.find(it->first.first);
+        if (table == m_syncdRoutes.end() || table->second.find(it->first.second) == table->second.end() ||
+            table->second.at(it->first.second).generation != it->second.first ||
+            !table->second.at(it->first.second).nhg_key.contains(nh))
         {
-            /* multiple mux nexthop case:
-             * skip for now, muxOrch::updateRoute() will handle route
-             */
-            SWSS_LOG_INFO("Route %s is mux multi nexthop route, skipping.",
-                        (*rt).prefix.to_string().c_str());
-
-            ++rt;
+            // Normal route deletion/replacement superseded this exact programmed incarnation.
+            it = journal.erase(it);
             continue;
         }
-
-        next_hop_id = m_neighOrch->getNextHopId(nextHop);
-        SWSS_LOG_INFO("Updating route %s with nexthop %" PRIu64, (*rt).prefix.to_string().c_str(), (uint64_t)next_hop_id);
-
-        route_entry.vr_id = (*rt).vrf_id;
-        route_entry.switch_id = gSwitchId;
-        copy(route_entry.destination, (*rt).prefix);
-
-        route_attr.id = SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID;
-        route_attr.value.oid = next_hop_id;
-
-        sai_status_t status = sai_route_api->set_route_entry_attribute(&route_entry, &route_attr);
-        if (status != SAI_STATUS_SUCCESS)
+        if (m_fgNhgOrch->syncdContainsFgNhg(it->first.first, it->first.second))
         {
-            SWSS_LOG_ERROR("Failed to update route %s, rv:%d", (*rt).prefix.to_string().c_str(), status);
-            if (mux_transition)
-            {
-                return false;
-            }
-            task_process_status handle_status = handleSaiSetStatus(SAI_API_ROUTE, status);
-            if (handle_status != task_success)
-            {
-                return parseHandleSaiStatusFailure(handle_status);
-            }
+            ++it;
+            continue;
         }
-
-        ++numRoutes;
-        ++rt;
+        auto target = it->second.second ? m_neighOrch->getLocalNextHopId(nh)
+                                      : gDirectory.get<MuxOrch*>()->getTunnelNextHopId();
+        bool restored = false;
+        try
+        {
+            restored = setMuxRouteNextHop(nh, RouteKey{it->first.first, it->first.second}, target);
+        }
+        catch (const std::exception& e)
+        {
+            SWSS_LOG_ERROR("MUX route recovery interrupted for %s: %s", it->first.second.to_string().c_str(), e.what());
+        }
+        if (restored)
+            it = journal.erase(it);
+        else
+        {
+            ret = false;
+            ++it;
+        }
     }
+    return ret;
+}
 
+bool RouteOrch::reconcileMuxNextHopRoutes(const NextHopKey& nh)
+{
+    auto routes = m_nextHops.find(nh);
+    if (routes == m_nextHops.end())
+        return true;
+    auto target = m_neighOrch->getNextHopId(nh);
+    bool local = target != SAI_NULL_OBJECT_ID && target == m_neighOrch->getLocalNextHopId(nh);
+    for (const auto& key : routes->second)
+    {
+        auto table = m_syncdRoutes.find(key.vrf_id);
+        if (table == m_syncdRoutes.end() || table->second.find(key.prefix) == table->second.end())
+            continue;
+        const auto& route = table->second.at(key.prefix);
+        if (route.nhg_key.getSize() != 1 || !route.nhg_key.contains(nh) ||
+            m_fgNhgOrch->syncdContainsFgNhg(key.vrf_id, key.prefix))
+            continue;
+        // New routes may have used the tunnel while local-NH recovery was pending.
+        if (route.mux_ref_released == local && !setMuxRouteNextHop(nh, key, target))
+            return false;
+    }
     return true;
+}
+
+MuxNextHopGroups RouteOrch::getMuxNextHopGroups(const NextHopKey& nh) const
+{
+    MuxNextHopGroups groups;
+    for (const auto& group : m_syncdNextHopGroups)
+        if (group.first.contains(nh) && group.second.next_hop_group_id != SAI_NULL_OBJECT_ID)
+            groups.emplace(group.first, group.second.generation);
+    return groups;
 }
 
 /**
@@ -2452,6 +2598,7 @@ bool RouteOrch::addRoutePost(const RouteBulkContext& ctx, const NextHopGroupKey 
     const IpPrefix& ipPrefix = ctx.ip_prefix;
     bool isFineGrained = false;
     bool blackhole = false;
+    bool mux_ref_released = ctx.nhg_index.empty() && isMuxRouteRefReleased(nextHops);
 
     const auto& object_statuses = ctx.object_statuses;
 
@@ -2565,7 +2712,8 @@ bool RouteOrch::addRoutePost(const RouteBulkContext& ctx, const NextHopGroupKey 
             {
                 /* Case where route was pointing to non-fine grained nhs in the past,
                  * and transitioned to Fine Grained ECMP */
-                decreaseNextHopRefCount(it_route->second.nhg_key);
+                if (!it_route->second.mux_ref_released)
+                    decreaseNextHopRefCount(it_route->second.nhg_key);
                 if (it_route->second.nhg_key.getSize() > 1
                     && m_syncdNextHopGroups[it_route->second.nhg_key].ref_count == 0)
                 {
@@ -2609,7 +2757,8 @@ bool RouteOrch::addRoutePost(const RouteBulkContext& ctx, const NextHopGroupKey 
         /* Increase the ref_count for the next hop group. */
         if (ctx.nhg_index.empty())
         {
-            increaseNextHopRefCount(nextHops);
+            if (!mux_ref_released)
+                increaseNextHopRefCount(nextHops);
         }
         else
         {
@@ -2667,7 +2816,8 @@ bool RouteOrch::addRoutePost(const RouteBulkContext& ctx, const NextHopGroupKey 
         /* Decrease the ref count for the previous next hop group. */
         else if (it_route->second.nhg_index.empty())
         {
-            decreaseNextHopRefCount(it_route->second.nhg_key);
+            if (!it_route->second.mux_ref_released)
+                decreaseNextHopRefCount(it_route->second.nhg_key);
             auto ol_nextHops = it_route->second.nhg_key;
             if (ol_nextHops.is_srv6_nexthop())
             {
@@ -2735,7 +2885,8 @@ bool RouteOrch::addRoutePost(const RouteBulkContext& ctx, const NextHopGroupKey 
         if (ctx.nhg_index.empty())
         {
             /* Increase the ref_count for the next hop (group) entry */
-            increaseNextHopRefCount(nextHops);
+            if (!mux_ref_released)
+                increaseNextHopRefCount(nextHops);
         }
         else
         {
@@ -2779,6 +2930,8 @@ bool RouteOrch::addRoutePost(const RouteBulkContext& ctx, const NextHopGroupKey 
     }
 
     m_syncdRoutes[vrf_id][ipPrefix] = RouteNhg(nextHops, ctx.nhg_index, ctx.context_index);
+    m_syncdRoutes[vrf_id][ipPrefix].generation = ++m_muxGeneration;
+    m_syncdRoutes[vrf_id][ipPrefix].mux_ref_released = mux_ref_released;
 
     /* If this was a temp route, record the original desired NHG key
      * so the guard in addRoute can detect NHG membership changes. */
@@ -2982,7 +3135,8 @@ bool RouteOrch::removeRoutePost(const RouteBulkContext& ctx)
         /*
          * Decrease the reference count only when the route is pointing to a next hop.
          */
-        decreaseNextHopRefCount(it_route->second.nhg_key);
+        if (!it_route->second.mux_ref_released)
+            decreaseNextHopRefCount(it_route->second.nhg_key);
 
         auto ol_nextHops = it_route->second.nhg_key;
 

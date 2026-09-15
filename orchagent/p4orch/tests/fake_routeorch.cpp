@@ -88,17 +88,19 @@ void RouteOrch::detach(Observer *observer, const IpAddress& dstAddr, sai_object_
 
 }
 
-bool RouteOrch::hasDefaultRouteNextHopGroup(const NextHopKey&) const
+bool RouteOrch::hasDefaultRouteNextHopGroup(const NextHopKey&, const MuxNextHopGroups*) const
 {
     return false;
 }
 
-bool RouteOrch::validnexthopinNextHopGroup(const NextHopKey &nexthop, uint32_t& count, bool mux_transition, bool local_ref)
+bool RouteOrch::validnexthopinNextHopGroup(const NextHopKey &nexthop, uint32_t& count, bool mux_transition, bool local_ref,
+                                         const MuxNextHopGroups*, const MuxRouteJournal*)
 {
     return true;
 }
 
-bool RouteOrch::invalidnexthopinNextHopGroup(const NextHopKey &nexthop, uint32_t& count, bool mux_transition, bool local_ref)
+bool RouteOrch::invalidnexthopinNextHopGroup(const NextHopKey &nexthop, uint32_t& count, bool mux_transition, bool local_ref,
+                                           const MuxNextHopGroups*, const MuxRouteJournal*)
 {
     return true;
 }
@@ -159,6 +161,21 @@ void RouteOrch::removeNextHopRoute(const NextHopKey& nextHop, const RouteKey& ro
 }
 
 bool RouteOrch::updateNextHopRoutes(const NextHopKey& nextHop, uint32_t& numRoutes, bool mux_transition)
+{
+    return true;
+}
+
+bool RouteOrch::updateMuxNextHopRoutes(const NextHopKey&, MuxRouteJournal&, bool)
+{
+    return true;
+}
+
+MuxNextHopGroups RouteOrch::getMuxNextHopGroups(const NextHopKey&) const
+{
+    return {};
+}
+
+bool RouteOrch::reconcileMuxNextHopRoutes(const NextHopKey&)
 {
     return true;
 }
