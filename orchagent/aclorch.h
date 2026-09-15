@@ -332,7 +332,7 @@ public:
     virtual bool update(const AclRule& updatedRule);
     virtual bool remove();
     virtual void onUpdate(SubjectType, void *) = 0;
-    virtual void updateInPorts();
+    virtual bool updateInPorts(const vector<sai_object_id_t>& ports);
 
     virtual bool enableCounter();
     virtual bool disableCounter();
