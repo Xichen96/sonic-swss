@@ -159,6 +159,7 @@ private:
 
     bool removeNextHop(const IpAddress&, const string&);
     bool processBulkAddNextHop(NeighborContext&);
+    NextHopKey getLocalNextHopKey(const NextHopKey&) const;
 
     bool addNeighbor(NeighborContext& ctx);
     void setNeighborData(const NeighborEntry&, const MacAddress&, bool hw_configured, bool prefix_route,

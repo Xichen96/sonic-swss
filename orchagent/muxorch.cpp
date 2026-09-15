@@ -611,6 +611,9 @@ bool MuxCable::setState(string new_state)
     SWSS_LOG_INFO("Changed state to %s", new_state.c_str());
 
     mux_cb_orch_->updateMuxState(mux_name_, new_state);
+    if (isActive())
+        for (const auto& neighbor : nbr_handler_->getNeighbors())
+            mux_orch_->adoptNeighbor(NextHopKey(neighbor.first, nbr_handler_->getAlias()), mux_name_);
     nbr_handler_->commitStateChange();
     return true;
 }
@@ -689,6 +692,9 @@ void MuxCable::rollbackStateChange()
         st_chg_failed_ = false;
         recovery_retry_at_ = {};
         recovery_retry_delay_ = std::chrono::seconds(1);
+        if (isActive())
+            for (const auto& neighbor : nbr_handler_->getNeighbors())
+                mux_orch_->adoptNeighbor(NextHopKey(neighbor.first, nbr_handler_->getAlias()), mux_name_);
         nbr_handler_->commitStateChange();
     }
     else
@@ -784,10 +790,14 @@ void MuxCable::updateNeighbor(NextHopKey nh, bool add)
                      nh.ip_address.to_string().c_str(), mux_name_.c_str(), add, state_);
 
     sai_object_id_t tnh = mux_orch_->getNextHopTunnelId(MUX_TUNNEL, peer_ip4_);
+    if (!add)
+        nbr_handler_->relinquishNeighbor(nh, false);
     nbr_handler_->update(nh, tnh, add, state_);
     if (add)
     {
         mux_orch_->addNexthop(nh, mux_name_);
+        if (isActive() || nbr_handler_type_ == MuxNbrHandlerType::NBR_HANDLER_PREFIX_BASED)
+            mux_orch_->adoptNeighbor(nh, mux_name_);
     }
     else if (mux_name_ == mux_orch_->getNexthopMuxName(nh))
     {
@@ -1016,6 +1026,38 @@ void MuxNbrHandler::commitStateChange()
     rollback_blocked_.clear();
 }
 
+void MuxNbrHandler::relinquishNeighbor(const NextHopKey& nh, bool adopted)
+{
+    auto member = gNeighOrch->getNeighborTable().find(nh);
+    auto progress = transition_.find(nh.ip_address);
+    if (nh.alias != alias_ || member == gNeighOrch->getNeighborTable().end() || progress == transition_.end() ||
+        progress->second.incarnation != member->second.incarnation ||
+        progress->second.incarnation->retired)
+        return;
+    progress->second.transferred = true;
+    for (auto& ctx : neighbor_contexts_)
+    {
+        if (ctx.neighborEntry != nh || ctx.incarnation != member->second.incarnation)
+            continue;
+        ctx.neighbor_removed = ctx.nexthop_removed = false;
+        if (adopted)
+        {
+            // A later FDB move back must not revive this record's old creation ownership.
+            if (member->second.hw_configured)
+                ctx.neighbor_created = false;
+            if (ctx.next_hop_id == gNeighOrch->getLocalNextHopId(nh))
+                ctx.nexthop_created = false;
+        }
+    }
+}
+
+void MuxNbrHandler::retireNextHop(const NextHopKey& nh, sai_object_id_t oid)
+{
+    for (auto& ctx : neighbor_contexts_)
+        if (ctx.neighborEntry == nh && ctx.next_hop_id == oid)
+            ctx.nexthop_created = false;
+}
+
 void MuxNbrHandler::startRouteUpdate(const IpAddress& ip, bool host_route)
 {
     auto progress = transition_.find(ip);
@@ -1117,6 +1159,36 @@ bool MuxNbrHandler::rollback(bool active, sai_object_id_t tunnel_nh, bool prefix
     for (auto& entry : transition_)
     {
         auto& progress = entry.second;
+        if (progress.transferred && !progress.incarnation->retired)
+        {
+            if (progress.rollback_done)
+                continue;
+            NextHopKey key(entry.first, alias_);
+            auto mux = gDirectory.get<MuxOrch*>();
+            auto owner_name = mux->getNexthopMuxName(key);
+            auto owner = mux->isMuxExists(owner_name) ? mux->getMuxCable(owner_name) : nullptr;
+            bool restored;
+            if (owner)
+            {
+                // The new association determines forwarding; never replay the old cable's role.
+                for (auto& route : progress.routes)
+                    route.second.second = owner->isActive();
+                restored = updateNeighborRoutes(key, owner->isActive(),
+                    owner->getNbrHandlerType() == MuxNbrHandlerType::NBR_HANDLER_PREFIX_BASED, true);
+            }
+            else
+            {
+                restored = !progress.routes_started || updateNeighborRoutes(key, active, prefix_based, true);
+            }
+            if (restored)
+                progress.route_result_unknown = false;
+            restored = restored && !progress.host_route_unknown;
+            progress.rollback_done = restored;
+            if (!restored)
+                rollback_blocked_.insert(entry.first);
+            ret = restored && ret;
+            continue;
+        }
         if (progress.incarnation && progress.incarnation->retired)
         {
             // A replacement owns its current host route. A confirmed delete may leave only our old route.
@@ -2748,6 +2820,23 @@ void MuxOrch::addNexthop(NextHopKey nh, string muxName)
     mux_nexthop_tb_[nh] = muxName;
 }
 
+void MuxOrch::adoptNeighbor(const NextHopKey& nh, const string& owner)
+{
+    if (getNexthopMuxName(nh) != owner || !neigh_orch_->isHwConfigured(nh) ||
+        neigh_orch_->getLocalNextHopId(nh) == SAI_NULL_OBJECT_ID)
+        return;
+    for (const auto& cable : mux_cable_tb_)
+        if (cable.first != owner && cable.second->isStateChangeFailed())
+            cable.second->relinquishNeighbor(nh, true);
+}
+
+void MuxOrch::retireNextHop(const NextHopKey& nh, sai_object_id_t oid)
+{
+    for (const auto& cable : mux_cable_tb_)
+        if (cable.second->isStateChangeFailed())
+            cable.second->retireNextHop(nh, oid);
+}
+
 void MuxOrch::removeNexthop(NextHopKey nh)
 {
     mux_nexthop_tb_.erase(nh);
@@ -2906,8 +2995,13 @@ bool MuxOrch::handleMuxCfg(const Request& request)
 {
     SWSS_LOG_ENTER();
 
-    auto srv_ip = request.getAttrIpPrefix("server_ipv4");
-    auto srv_ip6 = request.getAttrIpPrefix("server_ipv6");
+    auto existing = isMuxExists(request.getKeyString(0)) ? getMuxCable(request.getKeyString(0)) : nullptr;
+    if (existing && (existing->isStateChangeFailed() || existing->isStateChangeInProgress()))
+    {
+        SWSS_LOG_INFO("Deferring MUX configuration for %s until compensation completes",
+                      request.getKeyString(0).c_str());
+        return false;
+    }
 
     MuxCableType cable_type = MuxCableType::ACTIVE_STANDBY;
     auto nbr_handler_type = MuxNbrHandlerType::NBR_HANDLER_HOST_ROUTE;
@@ -2972,6 +3066,8 @@ bool MuxOrch::handleMuxCfg(const Request& request)
 
     if (op == SET_COMMAND)
     {
+        auto srv_ip = request.getAttrIpPrefix("server_ipv4");
+        auto srv_ip6 = request.getAttrIpPrefix("server_ipv6");
         if(isMuxExists(port_name))
         {
             SWSS_LOG_INFO("Mux for port '%s' already exists", port_name.c_str());

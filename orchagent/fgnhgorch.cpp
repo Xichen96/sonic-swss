@@ -3,6 +3,7 @@
 #include "fgnhgorch.h"
 #include "orch_zmq_config.h"
 #include "routeorch.h"
+#include "muxorch.h"
 #include "logger.h"
 #include "swssnet.h"
 #include "crmorch.h"
@@ -1297,6 +1298,21 @@ bool FgNhgOrch::setFgNhg(sai_object_id_t vrf_id, const IpPrefix &ipPrefix, const
     /* default isNextHopIdChanged to false so that sai route is unaffected
      * when we return early with success */
     isNextHopIdChanged = false;
+    auto mux = gDirectory.get<MuxOrch*>();
+    if (mux)
+    {
+        for (const auto& nh : nextHops.getNextHops())
+        {
+            auto owner = mux->getNexthopMuxName(nh);
+            auto cable = mux->isMuxExists(owner) ? mux->getMuxCable(owner) : nullptr;
+            if (cable && cable->isActive() && cable->isStateChangeFailed())
+            {
+                SWSS_LOG_INFO("Deferring FG route %s until MUX next-hop recovery completes",
+                              ipPrefix.to_string().c_str());
+                return false;
+            }
+        }
+    }
     FgNhgEntry *fgNhgEntry = 0;
     set<NextHopKey> next_hop_set = nextHops.getNextHops();
     auto prefix_entry = m_fgNhgPrefixes.find(ipPrefix);

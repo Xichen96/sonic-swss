@@ -110,6 +110,8 @@ public:
     bool rollback(bool active, sai_object_id_t tunnel_nh, bool prefix_based);
     bool cleanupRollback();
     void commitStateChange();
+    void relinquishNeighbor(const NextHopKey&, bool adopted);
+    void retireNextHop(const NextHopKey&, sai_object_id_t);
 
 protected:
     bool removeRoutes(std::list<MuxRouteBulkContext>& bulk_ctx_list);
@@ -135,6 +137,7 @@ protected:
         std::map<NextHopGroupKey, uint64_t> groups;
         bool route_result_unknown = false;
         bool rollback_done = false;
+        bool transferred = false;
         std::shared_ptr<NeighborIncarnation> incarnation;
     };
     std::map<IpAddress, NeighborProgress> transition_;
@@ -188,6 +191,8 @@ public:
         return (hasSlicePrefix() && !ip.isV4() && slice_ip6_.isAddressInSubnet(ip));
     }
     void updateNeighbor(NextHopKey nh, bool add);
+    void relinquishNeighbor(const NextHopKey& nh, bool adopted) { nbr_handler_->relinquishNeighbor(nh, adopted); }
+    void retireNextHop(const NextHopKey& nh, sai_object_id_t oid) { nbr_handler_->retireNextHop(nh, oid); }
     bool updateRoutes();
     void updateRoutesForNextHop(NextHopKey nh);
 
@@ -328,6 +333,8 @@ public:
     void update(SubjectType, void *);
 
     void addNexthop(NextHopKey, string = "");
+    void adoptNeighbor(const NextHopKey&, const string& owner);
+    void retireNextHop(const NextHopKey&, sai_object_id_t);
     void removeNexthop(NextHopKey);
     bool containsNextHop(const NextHopKey&);
     bool isMuxNexthops(const NextHopGroupKey&);

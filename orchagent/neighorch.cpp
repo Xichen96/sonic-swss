@@ -345,6 +345,20 @@ bool NeighOrch::isNeighborResolved(const NextHopKey &nexthop)
     return hasNextHop(base_nexthop);
 }
 
+NextHopKey NeighOrch::getLocalNextHopKey(const NextHopKey& nh) const
+{
+    // VOQ cache keys use inband; neighbor programming and RIF accounting retain the remote alias.
+    NextHopKey key(nh);
+    if (m_intfsOrch->isRemoteSystemPortIntf(nh.alias))
+    {
+        Port inband;
+        gPortsOrch->getInbandPort(inband);
+        assert(!inband.m_alias.empty());
+        key.alias = inband.m_alias;
+    }
+    return key;
+}
+
 bool NeighOrch::addNextHop(NeighborContext& ctx)
 {
     SWSS_LOG_ENTER();
@@ -367,16 +381,7 @@ bool NeighOrch::addNextHop(NeighborContext& ctx)
         }
     }
 
-    NextHopKey nexthop(nh);
-    if (m_intfsOrch->isRemoteSystemPortIntf(nh.alias))
-    {
-        //For remote system ports kernel nexthops are always on inband. Change the key
-        Port inbp;
-        gPortsOrch->getInbandPort(inbp);
-        assert(inbp.m_alias.length());
-
-        nexthop.alias = inbp.m_alias;
-    }
+    NextHopKey nexthop = getLocalNextHopKey(nh);
 
     assert(getLocalNextHopId(nexthop) == SAI_NULL_OBJECT_ID);
     sai_object_id_t rif_id = m_intfsOrch->getRouterIntfsId(nh.alias);
@@ -1081,7 +1086,7 @@ void NeighOrch::doTask(Consumer &consumer)
 
             bool nbr_not_found = (m_syncdNeighbors.find(neighbor_entry) == m_syncdNeighbors.end());
             bool repair = !nbr_not_found && m_syncdNeighbors.at(neighbor_entry).hw_configured &&
-                          (getLocalNextHopId(neighbor_entry) == SAI_NULL_OBJECT_ID ||
+                          (getLocalNextHopId(getLocalNextHopKey(neighbor_entry)) == SAI_NULL_OBJECT_ID ||
                            m_syncdNeighbors.at(neighbor_entry).incarnation->prefix_pending);
             if (nbr_not_found || m_syncdNeighbors[neighbor_entry].mac != mac_address || repair)
             {
@@ -1320,6 +1325,7 @@ void NeighOrch::setNeighborData(const NeighborEntry& entry, const MacAddress& ma
     if (old != m_syncdNeighbors.end() && old->second.incarnation != incarnation)
     {
         incarnation->prefix_owned = prefix_route && old->second.incarnation->prefix_owned;
+        incarnation->prefix_pending = prefix_route && old->second.incarnation->prefix_pending;
         old->second.incarnation->retired = true;
     }
     m_syncdNeighbors[entry] = {mac, hw_configured, 0, prefix_route, incarnation};
@@ -1448,7 +1454,8 @@ bool NeighOrch::addNeighbor(NeighborContext& ctx)
 
     bool hw_config = isHwConfigured(neighborEntry);
     const bool previous_hw_config = hw_config;
-    const auto previous_next_hop = getLocalNextHopId(neighborEntry);
+    const auto local_key = getLocalNextHopKey(neighborEntry);
+    const auto previous_next_hop = getLocalNextHopId(local_key);
     /*
      * Prefix-route mode programs neighbors with NO_HOST_ROUTE and controls
      * active/standby forwarding through the explicit host prefix route.  Keep
@@ -1495,7 +1502,7 @@ bool NeighOrch::addNeighbor(NeighborContext& ctx)
 
     if (bulk_op && hw_config && nbr_add_ready)
     {
-        return getLocalNextHopId(neighborEntry) != SAI_NULL_OBJECT_ID || addNextHop(ctx);
+        return getLocalNextHopId(local_key) != SAI_NULL_OBJECT_ID || addNextHop(ctx);
     }
 
     if (!hw_config && nbr_add_ready)
@@ -1506,7 +1513,7 @@ bool NeighOrch::addNeighbor(NeighborContext& ctx)
             SWSS_LOG_INFO("Adding neighbor entry %s on %s to bulker.", ip_address.to_string().c_str(), alias.c_str());
             object_statuses.emplace_back(SAI_STATUS_NOT_EXECUTED);
             gNeighBulker.create_entry(&object_statuses.back(), &neighbor_entry, (uint32_t)neighbor_attrs.size(), neighbor_attrs.data());
-            return getLocalNextHopId(neighborEntry) != SAI_NULL_OBJECT_ID || addNextHop(ctx);
+            return getLocalNextHopId(local_key) != SAI_NULL_OBJECT_ID || addNextHop(ctx);
         }
 
         status = sai_neighbor_api->create_neighbor_entry(&neighbor_entry,
@@ -1592,17 +1599,20 @@ bool NeighOrch::addNeighbor(NeighborContext& ctx)
         SWSS_LOG_NOTICE("Updated neighbor %s on %s", macAddress.to_string().c_str(), alias.c_str());
     }
 
-    if (!bulk_op && hw_config && getLocalNextHopId(neighborEntry) == SAI_NULL_OBJECT_ID && !addNextHop(ctx))
+    if (!bulk_op && hw_config && getLocalNextHopId(local_key) == SAI_NULL_OBJECT_ID && !addNextHop(ctx))
         return false;
     setNeighborData(neighborEntry, macAddress, hw_config, prefix_route,
                     !bulk_op && (previous_hw_config != hw_config ||
-                                 previous_next_hop != getLocalNextHopId(neighborEntry)));
-    if (hw_config && prefix_route)
+                                 previous_next_hop != getLocalNextHopId(local_key)));
+    if (hw_config && prefix_route &&
+        (!m_syncdNeighbors.at(neighborEntry).incarnation->prefix_owned ||
+         m_syncdNeighbors.at(neighborEntry).incarnation->prefix_pending ||
+         previous_next_hop != getLocalNextHopId(local_key)))
     {
         auto incarnation = m_syncdNeighbors.at(neighborEntry).incarnation;
         // Preserve primary-object ownership even if its dependent route must be retried.
         incarnation->prefix_pending = true;
-        if (!addPrefixRouteForNeighbor(ip_address, alias, getLocalNextHopId(neighborEntry), is_nbr_active))
+        if (!addPrefixRouteForNeighbor(ip_address, alias, getLocalNextHopId(local_key), is_nbr_active))
             return false;
         incarnation->prefix_pending = false;
     }
@@ -1684,7 +1694,8 @@ bool NeighOrch::removeNeighbor(NeighborContext& ctx, bool disable)
         auto local = m_syncdNextHops.find(nexthop);
         if (local != m_syncdNextHops.end())
         {
-            status = sai_next_hop_api->remove_next_hop(local->second.next_hop_id);
+            auto removed_id = local->second.next_hop_id;
+            status = sai_next_hop_api->remove_next_hop(removed_id);
             if (status != SAI_STATUS_SUCCESS && status != SAI_STATUS_ITEM_NOT_FOUND)
             {
                 task_process_status handle_status = handleSaiRemoveStatus(SAI_API_NEXT_HOP, status);
@@ -1695,6 +1706,9 @@ bool NeighOrch::removeNeighbor(NeighborContext& ctx, bool disable)
                 return false;
             gCrmOrch->decCrmResUsedCounter(ip_address.isV4()
                 ? CrmResourceType::CRM_IPV4_NEXTHOP : CrmResourceType::CRM_IPV6_NEXTHOP);
+            auto mux = gDirectory.get<MuxOrch*>();
+            if (mux)
+                mux->retireNextHop(neighborEntry, removed_id);
         }
     }
 
@@ -2730,6 +2744,8 @@ bool NeighOrch::convertToPrefixBasedNbr(const NeighborEntry &neighborEntry, sai_
 
     // Update the neighbor data to mark it as prefix_route
     m_syncdNeighbors[neighborEntry].prefix_route = true;
+    neighbor_it->second.incarnation->prefix_owned = true;
+    neighbor_it->second.incarnation->prefix_pending = false;
 
     SWSS_LOG_NOTICE("Successfully converted neighbor %s on %s to MUX neighbor with prefix route",
                      ip_address.to_string().c_str(), alias.c_str());
