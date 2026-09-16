@@ -1764,7 +1764,8 @@ bool RouteOrch::removeNextHopGroup(const NextHopGroupKey &nexthops, const bool i
     SWSS_LOG_NOTICE("Delete next hop group %s", nexthops.to_string().c_str());
 
     vector<sai_object_id_t> next_hop_ids;
-    set<NextHopKey> mux_released_members;
+    vector<NextHopKey> member_keys;
+    auto& mux_released_members = next_hop_group_entry->second.mux_released_members;
     /* If the NexthopGroup is the one that has been swapped with default route members
      * than when deleting such Nexthop Group we have to remove default route nexthop group members */
     auto& nhgm = is_default_route_nh_swap ? next_hop_group_entry->second.default_route_nhopgroup_members : next_hop_group_entry->second.nhopgroup_members;
@@ -1798,31 +1799,33 @@ bool RouteOrch::removeNextHopGroup(const NextHopGroupKey &nexthops, const bool i
         }
 
         next_hop_ids.push_back(nhop->second.next_hop_id);
-        nhop = nhgm.erase(nhop);
+        member_keys.push_back(nhop->first);
+        ++nhop;
     }
 
     size_t nhid_count = next_hop_ids.size();
-    vector<sai_status_t> statuses(nhid_count);
+    vector<sai_status_t> statuses(nhid_count, SAI_STATUS_NOT_EXECUTED);
     for (size_t i = 0; i < nhid_count; i++)
     {
         gNextHopGroupMemberBulker.remove_entry(&statuses[i], next_hop_ids[i]);
     }
     gNextHopGroupMemberBulker.flush();
+    bool members_removed = true;
     for (size_t i = 0; i < nhid_count; i++)
     {
-        if (statuses[i] != SAI_STATUS_SUCCESS)
+        if (statuses[i] != SAI_STATUS_SUCCESS && statuses[i] != SAI_STATUS_ITEM_NOT_FOUND)
         {
             SWSS_LOG_ERROR("Failed to remove next hop group member[%zu] %" PRIx64 ", rv:%d",
                            i, next_hop_ids[i], statuses[i]);
-            task_process_status handle_status = handleSaiRemoveStatus(SAI_API_NEXT_HOP_GROUP, statuses[i]);
-            if (handle_status != task_success)
-            {
-                return parseHandleSaiStatusFailure(handle_status);
-            }
+            members_removed = false;
+            continue;
         }
 
+        nhgm.erase(member_keys[i]);
         gCrmOrch->decCrmResUsedCounter(CrmResourceType::CRM_NEXTHOP_GROUP_MEMBER);
     }
+    if (!members_removed)
+        return false;
 
     status = sai_next_hop_group_api->remove_next_hop_group(next_hop_group_id);
     if (status != SAI_STATUS_SUCCESS)

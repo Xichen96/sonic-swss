@@ -100,7 +100,8 @@ public:
 
     virtual bool enable(bool update_rt);
     virtual bool disable(sai_object_id_t);
-    virtual void update(NextHopKey nh, sai_object_id_t, bool = true, MuxState = MuxState::MUX_STATE_INIT);
+    virtual bool update(NextHopKey nh, sai_object_id_t, bool = true, MuxState = MuxState::MUX_STATE_INIT,
+                        bool routes_ready = true);
 
     virtual sai_object_id_t getNextHopId(const NextHopKey);
     MuxNeighbor getNeighbors() const { return neighbors_; };
@@ -157,7 +158,8 @@ public:
 
     bool enable(bool update_rt) override;
     bool disable(sai_object_id_t) override;
-    void update(NextHopKey nh, sai_object_id_t, bool = true, MuxState = MuxState::MUX_STATE_INIT) override;
+    bool update(NextHopKey nh, sai_object_id_t, bool = true, MuxState = MuxState::MUX_STATE_INIT,
+                bool routes_ready = true) override;
 };
 
 // Mux Cable object
@@ -191,12 +193,12 @@ public:
     {
         return (hasSlicePrefix() && !ip.isV4() && slice_ip6_.isAddressInSubnet(ip));
     }
-    void updateNeighbor(NextHopKey nh, bool add);
+    bool updateNeighbor(NextHopKey nh, bool add);
     void relinquishNeighbor(const NextHopKey& nh, bool adopted) { nbr_handler_->relinquishNeighbor(nh, adopted); }
     void retireNextHop(const NextHopKey& nh, sai_object_id_t oid) { nbr_handler_->retireNextHop(nh, oid); }
     bool hasPendingNextHopRecovery(const NextHopKey& nh) const { return nbr_handler_->hasPendingNextHopRecovery(nh); }
     bool updateRoutes();
-    void updateRoutesForNextHop(NextHopKey nh);
+    bool updateRoutesForNextHop(NextHopKey nh);
 
     // Slice supernet route tracking (see refreshSliceRoute in muxorch.cpp).
     bool refreshSliceRoute();
@@ -372,7 +374,7 @@ private:
     bool handleMuxCfg(const Request&);
     bool handlePeerSwitch(const Request&);
 
-    void updateNeighbor(const NeighborUpdate&);
+    bool updateNeighbor(const NeighborUpdate&);
     void updateFdb(const FdbUpdate&);
 
     // Helper function to convert neighbor to MUX neighbor

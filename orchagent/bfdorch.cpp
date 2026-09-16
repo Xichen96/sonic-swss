@@ -316,6 +316,13 @@ bool BfdOrch::register_bfd_state_change_notification(void)
 
 void BfdOrch::update(SubjectType type, void *cntx)
 {
+    if (type == SUBJECT_TYPE_NEIGH_NEXT_HOP_BINDING)
+    {
+        auto *update = static_cast<NeighborNextHopBindingUpdate *>(cntx);
+        if (!updateNextHopId(update->entry.alias, update->entry.ip_address, update->next_hop_id))
+            update->success = false;
+        return;
+    }
     if (type != SUBJECT_TYPE_NEIGH_CHANGE)
     {
         return;
@@ -327,14 +334,15 @@ void BfdOrch::update(SubjectType type, void *cntx)
     if (update->add)
     {
         NextHopKey nexthop_key(update->entry.ip_address, update->entry.alias);
-        next_hop_id = gNeighOrch->getLocalNextHopId(nexthop_key);
+        next_hop_id = gNeighOrch->getReadyLocalNextHopId(nexthop_key);
     }
 
     updateNextHopId(update->entry.alias, update->entry.ip_address, next_hop_id);
 }
 
-void BfdOrch::updateNextHopId(const string& alias, const IpAddress& peer_address, sai_object_id_t next_hop_id)
+bool BfdOrch::updateNextHopId(const string& alias, const IpAddress& peer_address, sai_object_id_t next_hop_id)
 {
+    bool success = true;
     for (auto &it : bfd_inject_next_hop_lookup)
     {
         const string& key = it.first;
@@ -354,7 +362,8 @@ void BfdOrch::updateNextHopId(const string& alias, const IpAddress& peer_address
         if (inject.bfd_session_id == SAI_NULL_OBJECT_ID)
         {
             SWSS_LOG_ERROR("Failed to update next hop id, bfd session %s id is null", key.c_str());
-            return;
+            success = false;
+            continue;
         }
 
         SWSS_LOG_INFO("BFD: update nexthop id, next hop %s on %s, next_hop_id %llu",
@@ -368,10 +377,12 @@ void BfdOrch::updateNextHopId(const string& alias, const IpAddress& peer_address
         if (status != SAI_STATUS_SUCCESS)
         {
             SWSS_LOG_ERROR("Failed to update bfd session attribute %s, rv:%d", key.c_str(), status);
-            return;
+            success = false;
+            continue;
         }
         inject.next_hop_id = next_hop_id;
     }
+    return success;
 }
 
 bool BfdOrch::create_bfd_session(const string& key, const vector<FieldValueTuple>& data)
@@ -574,7 +585,7 @@ bool BfdOrch::create_bfd_session(const string& key, const vector<FieldValueTuple
             attrs.emplace_back(attr);
 
             NextHopKey nexthop_key = NextHopKey(peer_address, alias);
-            sai_object_id_t next_hop_id = gNeighOrch->getLocalNextHopId(nexthop_key);
+            sai_object_id_t next_hop_id = gNeighOrch->getReadyLocalNextHopId(nexthop_key);
 
             attr.id = SAI_BFD_SESSION_ATTR_NEXT_HOP_ID;
             attr.value.oid = next_hop_id;
@@ -949,4 +960,3 @@ void BgpGlobalStateOrch::doTask(Consumer &consumer)
         it = consumer.m_toSync.erase(it);
     }
 }
-

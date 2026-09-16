@@ -52,6 +52,15 @@ struct NeighborUpdate
     NeighborEntry entry;
     MacAddress mac;
     bool add;
+    bool success = true;
+};
+
+// Synchronous dependency preparation; this does not announce neighbor deletion.
+struct NeighborNextHopBindingUpdate
+{
+    NeighborEntry entry;
+    sai_object_id_t next_hop_id;
+    bool success = true;
 };
 
 /*
@@ -97,6 +106,7 @@ public:
 
     sai_object_id_t getNextHopId(const NextHopKey&);
     sai_object_id_t getLocalNextHopId(const NextHopKey&);
+    sai_object_id_t getReadyLocalNextHopId(const NeighborEntry&);
     int getNextHopRefCount(const NextHopKey&);
 
     void increaseNextHopRefCount(const NextHopKey&, uint32_t count = 1);
@@ -110,6 +120,7 @@ public:
 
     bool enableNeighbor(const NeighborEntry&);
     bool needsActiveMuxNeighborRepair(const NeighborEntry&, const MacAddress&);
+    void retryNeighborUpdate(const NeighborEntry&, const std::string& owner);
     bool disableNeighbor(const NeighborEntry&);
     bool enableNeighbors(std::list<NeighborContext>&);
     bool disableNeighbors(std::list<NeighborContext>&);
@@ -161,6 +172,8 @@ private:
     bool removeNextHop(const IpAddress&, const string&);
     bool processBulkAddNextHop(NeighborContext&);
     NextHopKey getLocalNextHopKey(const NextHopKey&) const;
+    bool updateNextHopBindings(const NeighborEntry&, sai_object_id_t);
+    bool notifyNeighborAdd(const NeighborEntry&, const MacAddress&);
 
     bool addNeighbor(NeighborContext& ctx);
     void setNeighborData(const NeighborEntry&, const MacAddress&, bool hw_configured, bool prefix_route,

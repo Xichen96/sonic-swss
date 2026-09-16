@@ -41,7 +41,7 @@ private:
     bool remove_bfd_session(const std::string& key);
     std::string get_state_db_key(const std::string& vrf_name, const std::string& alias, const swss::IpAddress& peer_address);
     std::string get_app_db_key(const std::string& vrf_name, const std::string& alias, const swss::IpAddress& peer_address);
-    void updateNextHopId(const std::string& alias, const swss::IpAddress& peer_address, sai_object_id_t next_hop_id);
+    bool updateNextHopId(const std::string& alias, const swss::IpAddress& peer_address, sai_object_id_t next_hop_id);
 
     uint32_t bfd_gen_id(void);
     uint32_t bfd_src_port(void);

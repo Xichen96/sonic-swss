@@ -56,6 +56,7 @@ struct NextHopGroupEntry
     sai_object_id_t         next_hop_group_id;      // next hop group id
     int                     ref_count;              // reference count
     NextHopGroupMembers     nhopgroup_members;      // ids of members indexed by <ip_address, if_alias>
+    std::set<NextHopKey>     mux_released_members;   // retained after member removal until group deletion commits
     NextHopGroupMembers     default_route_nhopgroup_members;      // ids of members indexed by <ip_address, if_alias>
     uint32_t                nh_member_install_count;
     bool                    eligible_for_default_route_nh_swap;
