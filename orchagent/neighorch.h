@@ -109,6 +109,7 @@ public:
     const NeighborTable& getNeighborTable() const { return m_syncdNeighbors; }
 
     bool enableNeighbor(const NeighborEntry&);
+    bool needsActiveMuxNeighborRepair(const NeighborEntry&, const MacAddress&);
     bool disableNeighbor(const NeighborEntry&);
     bool enableNeighbors(std::list<NeighborContext>&);
     bool disableNeighbors(std::list<NeighborContext>&);

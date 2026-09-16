@@ -1303,11 +1303,9 @@ bool FgNhgOrch::setFgNhg(sai_object_id_t vrf_id, const IpPrefix &ipPrefix, const
     {
         for (const auto& nh : nextHops.getNextHops())
         {
-            auto owner = mux->getNexthopMuxName(nh);
-            auto cable = mux->isMuxExists(owner) ? mux->getMuxCable(owner) : nullptr;
-            if (cable && cable->isActive() && cable->isStateChangeFailed())
+            if (mux->hasPendingNextHopRecovery(nh))
             {
-                SWSS_LOG_INFO("Deferring FG route %s until MUX next-hop recovery completes",
+                SWSS_LOG_INFO("Deferring FG route %s until next-hop ownership and prerequisites are settled",
                               ipPrefix.to_string().c_str());
                 return false;
             }
