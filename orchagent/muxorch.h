@@ -112,6 +112,7 @@ public:
     void commitStateChange();
     void relinquishNeighbor(const NextHopKey&, bool adopted);
     void retireNextHop(const NextHopKey&, sai_object_id_t);
+    bool hasPendingNextHopRecovery(const NextHopKey&) const;
 
 protected:
     bool removeRoutes(std::list<MuxRouteBulkContext>& bulk_ctx_list);
@@ -193,6 +194,7 @@ public:
     void updateNeighbor(NextHopKey nh, bool add);
     void relinquishNeighbor(const NextHopKey& nh, bool adopted) { nbr_handler_->relinquishNeighbor(nh, adopted); }
     void retireNextHop(const NextHopKey& nh, sai_object_id_t oid) { nbr_handler_->retireNextHop(nh, oid); }
+    bool hasPendingNextHopRecovery(const NextHopKey& nh) const { return nbr_handler_->hasPendingNextHopRecovery(nh); }
     bool updateRoutes();
     void updateRoutesForNextHop(NextHopKey nh);
 
@@ -324,6 +326,8 @@ public:
     }
 
     MuxCable* findMuxCableInSubnet(IpAddress);
+    MuxCable* findMuxCableForNeighbor(const NextHopKey&, const MacAddress&);
+    bool hasPendingNextHopRecovery(const NextHopKey&);
 
     MuxCable* findMuxCableBySlice(IpAddress);
     bool isSuppressedNeighbor(const IpAddress& ip, const std::string& port_name, MuxCable** out_cable = nullptr);

@@ -928,14 +928,23 @@ void MuxNbrHandler::update(NextHopKey nh, sai_object_id_t tunnelId, bool add, Mu
 
         if (neighbors_.find(nh.ip_address) != neighbors_.end())
         {
+            if (state == MuxState::MUX_STATE_ACTIVE &&
+                (!gNeighOrch->isHwConfigured(nh) || gNeighOrch->getLocalNextHopId(nh) == SAI_NULL_OBJECT_ID))
+            {
+                neighbors_.at(nh.ip_address) = tunnelId;
+                return;
+            }
             auto progress = transition_.find(nh.ip_address);
-            if (progress != transition_.end() && progress->second.incarnation &&
-                progress->second.incarnation->retired)
+            if ((progress != transition_.end() && progress->second.incarnation &&
+                 progress->second.incarnation->retired) ||
+                (state == MuxState::MUX_STATE_ACTIVE &&
+                 neighbors_.at(nh.ip_address) != gNeighOrch->getLocalNextHopId(nh)))
             {
                 neighbors_.at(nh.ip_address) = state == MuxState::MUX_STATE_ACTIVE
                     ? gNeighOrch->getLocalNextHopId(nh) : tunnelId;
                 gRouteOrch->updateNextHopRoutes(nh, num_routes);
-                if (state == MuxState::MUX_STATE_ACTIVE && progress->second.host_route_created &&
+                if (state == MuxState::MUX_STATE_ACTIVE && progress != transition_.end() &&
+                    progress->second.host_route_created &&
                     remove_route(pfx) == SAI_STATUS_SUCCESS)
                 {
                     progress->second.host_route_created = false;
@@ -951,8 +960,12 @@ void MuxNbrHandler::update(NextHopKey nh, sai_object_id_t tunnelId, bool add, Mu
             neighbors_[nh.ip_address] = SAI_NULL_OBJECT_ID;
             break;
         case MuxState::MUX_STATE_ACTIVE:
+            neighbors_[nh.ip_address] = tunnelId;
+            // A deferred native repair must not project routes through incomplete primary objects.
+            if (!gNeighOrch->enableNeighbor(nh) || !gNeighOrch->isHwConfigured(nh) ||
+                gNeighOrch->getLocalNextHopId(nh) == SAI_NULL_OBJECT_ID)
+                break;
             neighbors_[nh.ip_address] = gNeighOrch->getLocalNextHopId(nh);
-            gNeighOrch->enableNeighbor(nh);
             gRouteOrch->updateNextHopRoutes(nh, num_routes);
             break;
         case MuxState::MUX_STATE_STANDBY:
@@ -1056,6 +1069,23 @@ void MuxNbrHandler::retireNextHop(const NextHopKey& nh, sai_object_id_t oid)
     for (auto& ctx : neighbor_contexts_)
         if (ctx.neighborEntry == nh && ctx.next_hop_id == oid)
             ctx.nexthop_created = false;
+}
+
+bool MuxNbrHandler::hasPendingNextHopRecovery(const NextHopKey& nh) const
+{
+    for (const auto& ctx : neighbor_contexts_)
+    {
+        if (ctx.neighborEntry != nh)
+            continue;
+        if (ctx.result_unknown)
+            return true;
+        if (ctx.incarnation && ctx.incarnation->retired)
+            continue;
+        // A different current incarnation/OID is a conflict, not evidence that this ownership was settled.
+        if (ctx.nexthop_created)
+            return true;
+    }
+    return false;
 }
 
 void MuxNbrHandler::startRouteUpdate(const IpAddress& ip, bool host_route)
@@ -1747,8 +1777,10 @@ void MuxPrefixBasedNbrHandler::update(NextHopKey nh, sai_object_id_t tunnelId, b
         if (neighbors_.find(nh.ip_address) != neighbors_.end())
         {
             auto progress = transition_.find(nh.ip_address);
-            if (progress == transition_.end() || !progress->second.incarnation ||
-                !progress->second.incarnation->retired)
+            if ((progress == transition_.end() || !progress->second.incarnation ||
+                 !progress->second.incarnation->retired) &&
+                (state != MuxState::MUX_STATE_ACTIVE ||
+                 neighbors_.at(nh.ip_address) == gNeighOrch->getLocalNextHopId(nh)))
                 return;
         }
 
@@ -2170,10 +2202,9 @@ bool MuxOrch::updateRoute(const IpPrefix &pfx)
         NeighborEntry neighbor;
         MacAddress mac;
 
-        if (!gNeighOrch->getNeighborEntry(nexthop, neighbor, mac))
+        if (!gNeighOrch->getNeighborEntry(nexthop, neighbor, mac) || !gNeighOrch->isHwConfigured(neighbor))
         {
-            // Not able to get neighbor entry, so skip.
-            SWSS_LOG_NOTICE("Neighbor entry for nexthop %s not found.",
+            SWSS_LOG_NOTICE("Neighbor hardware for nexthop %s is not ready.",
                             nexthop.to_string().c_str());
             continue;
         }
@@ -2349,43 +2380,47 @@ bool MuxOrch::isMuxPortPrefixNbr(const IpAddress& nbr, const MacAddress& mac, st
     return false;
 }
 
-bool MuxOrch::isNeighborActive(const IpAddress& nbr, const MacAddress& mac, string& alias)
+MuxCable* MuxOrch::findMuxCableForNeighbor(const NextHopKey& nh, const MacAddress& mac)
 {
     if (mux_cable_tb_.empty())
-    {
-        return true;
-    }
-
-    MuxCable* ptr = findMuxCableInSubnet(nbr);
-
-    if (ptr)
-    {
-        return ptr->isActive();
-    }
+        return nullptr;
+    auto cable = findMuxCableInSubnet(nh.ip_address);
+    if (cable)
+        return cable;
 
     string port;
-    if (!getMuxPort(mac, alias, port))
+    if (!getMuxPort(mac, nh.alias, port))
     {
         SWSS_LOG_INFO("Mux get port from FDB failed for '%s' mac '%s'",
-                       nbr.to_string().c_str(), mac.to_string().c_str());
+                      nh.ip_address.to_string().c_str(), mac.to_string().c_str());
+        return nullptr;
+    }
+    if (port.empty())
+        port = getNexthopMuxName(nh);
+    return isMuxExists(port) ? getMuxCable(port) : nullptr;
+}
+
+bool MuxOrch::isNeighborActive(const IpAddress& nbr, const MacAddress& mac, string& alias)
+{
+    auto cable = findMuxCableForNeighbor(NextHopKey(nbr, alias), mac);
+    return !cable || cable->isActive();
+}
+
+bool MuxOrch::hasPendingNextHopRecovery(const NextHopKey& nh)
+{
+    const auto& neighbors = neigh_orch_->getNeighborTable();
+    auto neighbor = neighbors.find(nh);
+    if (neighbor != neighbors.end() &&
+        (neighbor->second.incarnation->prefix_pending ||
+         neigh_orch_->needsActiveMuxNeighborRepair(nh, neighbor->second.mac)))
         return true;
-    }
-
-    if (!port.empty() && isMuxExists(port))
-    {
-        MuxCable* ptr = getMuxCable(port);
-        return ptr->isActive();
-    }
-
-    NextHopKey nh_key = NextHopKey(nbr, alias);
-    string curr_port = getNexthopMuxName(nh_key);
-    if (port.empty() && !curr_port.empty() && isMuxExists(curr_port))
-    {
-        MuxCable* ptr = getMuxCable(curr_port);
-        return ptr->isActive();
-    }
-
-    return true;
+    auto owner = getNexthopMuxName(nh);
+    if (isMuxExists(owner) && getMuxCable(owner)->isActive() && getMuxCable(owner)->isStateChangeFailed())
+        return true;
+    for (const auto& cable : mux_cable_tb_)
+        if (cable.second->isStateChangeFailed() && cable.second->hasPendingNextHopRecovery(nh))
+            return true;
+    return false;
 }
 
 bool MuxOrch::getMuxPort(const MacAddress& mac, const string& alias, string& portName)
@@ -2779,11 +2814,15 @@ void MuxOrch::updateNeighbor(const NeighborUpdate& update)
         /* Check if the neighbor already exists */
         old_port = getNexthopMuxName(update.entry);
 
-        /* if new port from FDB is empty or same as existing port, return and
-         * no further handling is required
-         */
-        if (port.empty() || old_port == port)
+        // A same-port notification may complete a queued repair with a new local NH.
+        if (port.empty())
         {
+            return;
+        }
+        if (old_port == port)
+        {
+            if (isMuxExists(port))
+                getMuxCable(port)->updateNeighbor(update.entry, true);
             return;
         }
 

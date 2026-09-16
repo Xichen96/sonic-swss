@@ -26,9 +26,11 @@
 #include <cstring>
 #include <tuple>
 #include "swssnet.h"
+#include "subscriberstatetable.h"
 
 EXTERN_MOCK_FNS
 extern std::string gMySwitchType;
+extern bool gMultiAsicVoq;
 
 namespace mux_rollback_test
 {
@@ -983,12 +985,12 @@ namespace mux_rollback_test
             static_cast<Orch*>(m_MuxOrch)->doTask();
         }
 
-        void ConfigureFg(const string& prefix)
+        void ConfigureFg(const string& prefix, const string& ip = SERVER_IP1)
         {
             const vector<pair<string, KeyOpFieldsValuesTuple>> operations{
                 {CFG_FG_NHG, KeyOpFieldsValuesTuple("mux-recovery-fg", SET_COMMAND,
                     vector<FieldValueTuple>{{"bucket_size", "8"}, {"match_mode", "route-based"}})},
-                {CFG_FG_NHG_MEMBER, KeyOpFieldsValuesTuple(SERVER_IP1, SET_COMMAND,
+                {CFG_FG_NHG_MEMBER, KeyOpFieldsValuesTuple(ip, SET_COMMAND,
                     vector<FieldValueTuple>{{"FG_NHG", "mux-recovery-fg"}, {"bank", "0"}})},
                 {CFG_FG_NHG_PREFIX, KeyOpFieldsValuesTuple(prefix, SET_COMMAND,
                     vector<FieldValueTuple>{{"FG_NHG", "mux-recovery-fg"}})}
@@ -1000,6 +1002,21 @@ namespace mux_rollback_test
                 consumer->addToSync(operation.second);
                 static_cast<Orch*>(gFgNhgOrch)->doTask();
                 ASSERT_EQ(0u, consumer->m_toSync.size());
+            }
+        }
+
+        void ExpectFgNextHop(const string& prefix, sai_object_id_t target)
+        {
+            ASSERT_TRUE(gFgNhgOrch->syncdContainsFgNhg(gVirtualRouterId, IpPrefix(prefix)));
+            const auto& fg = gFgNhgOrch->m_syncdFGRouteTables.at(gVirtualRouterId).at(IpPrefix(prefix));
+            ASSERT_FALSE(fg.nhopgroup_members.empty());
+            for (auto member : fg.nhopgroup_members)
+            {
+                sai_attribute_t attr{};
+                attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_ID;
+                ASSERT_EQ(SAI_STATUS_SUCCESS,
+                    old_sai_next_hop_group_api->get_next_hop_group_member_attribute(member, 1, &attr));
+                EXPECT_EQ(target, attr.value.oid);
             }
         }
 
@@ -1251,6 +1268,56 @@ namespace mux_rollback_test
             EXPECT_EQ(0, gNeighOrch->getNextHopRefCount(Key(moving_ip)));
             NeighborEvent(moving_ip, false);
         }
+
+        void HoldIndependentFailure(bool neighbor_present, bool& blocked, bool retain_route = false)
+        {
+            SetMuxStateFromAppDb(ACTIVE_STATE, "Ethernet8");
+            SetFdb(moving_mac, TEST_INTERFACE);
+            NeighborEvent(moving_ip, true, moving_mac);
+            if (retain_route)
+                AddRoute("10.64.0.0/24", moving_ip);
+            if (neighbor_present)
+            {
+                EXPECT_CALL(*mock_sai_next_hop_api, create_next_hops)
+                    .WillOnce([](GENERIC_BULK_CREATE_PARAMS(next_hop)) -> sai_status_t {
+                        for (uint32_t i = 0; i < object_count; ++i)
+                        {
+                            object_id[i] = SAI_NULL_OBJECT_ID;
+                            object_statuses[i] = SAI_STATUS_TABLE_FULL;
+                        }
+                        return SAI_STATUS_FAILURE;
+                    });
+                EXPECT_CALL(*mock_sai_neighbor_api, remove_neighbor_entry)
+                    .WillRepeatedly([&, this](const sai_neighbor_entry_t* entry) -> sai_status_t {
+                        if (blocked && sai_serialize_ip_address(entry->ip_address) == moving_ip)
+                            return SAI_STATUS_FAILURE;
+                        return old_sai_neighbor_api->remove_neighbor_entry(entry);
+                    });
+            }
+            else
+            {
+                EXPECT_CALL(*mock_sai_neighbor_api, create_neighbor_entries)
+                    .WillOnce([this](CREATE_BULK_PARAMS(neighbor)) -> sai_status_t {
+                        for (uint32_t i = 0; i < object_count; ++i)
+                            object_statuses[i] = sai_serialize_ip_address(neighbor_entry[i].ip_address) == moving_ip
+                                ? SAI_STATUS_FAILURE
+                                : old_sai_neighbor_api->create_neighbor_entry(&neighbor_entry[i], attr_count[i], attr_list[i]);
+                        return SAI_STATUS_FAILURE;
+                    });
+                EXPECT_CALL(*mock_sai_next_hop_api, remove_next_hop)
+                    .WillRepeatedly([&, this](sai_object_id_t oid) -> sai_status_t {
+                        if (blocked && oid == gNeighOrch->getLocalNextHopId(Key(moving_ip)))
+                            return SAI_STATUS_FAILURE;
+                        return old_sai_next_hop_api->remove_next_hop(oid);
+                    });
+            }
+            SetMuxStateFromAppDb(ACTIVE_STATE);
+            ASSERT_TRUE(m_MuxCable->isStateChangeFailed());
+            EXPECT_EQ(neighbor_present, gNeighOrch->isHwConfigured(Key(moving_ip)));
+            EXPECT_EQ(!neighbor_present, gNeighOrch->getLocalNextHopId(Key(moving_ip)) != SAI_NULL_OBJECT_ID);
+            m_MuxCable->recovery_retry_at_ = std::chrono::steady_clock::now() + std::chrono::hours(1);
+            SetMuxStateFromAppDb(STANDBY_STATE);
+        }
     };
 
     class MuxConversionTest : public MuxPrefixRecoveryTest,
@@ -1258,6 +1325,90 @@ namespace mux_rollback_test
     {
     protected:
         MuxConversionTest() { m_second_cable = true; }
+    };
+
+    class MuxFgAdmissionTest : public MuxAssociationTest,
+                               public testing::WithParamInterface<tuple<bool, bool>> {};
+
+    class MuxNativeReceiverTest : public MuxAssociationTest,
+                                  public testing::WithParamInterface<tuple<bool, bool>> {};
+
+    class MuxPrefixMacTest : public MuxPrefixRecoveryTest,
+                            public testing::WithParamInterface<bool>
+    {
+    protected:
+        MuxPrefixMacTest() { m_second_cable = true; }
+    };
+
+    class MuxVoqSystemTest : public MuxHybridTest, public testing::WithParamInterface<bool>
+    {
+    protected:
+        const string remote = "remote|asic0|Ethernet0";
+        const string ip = "192.168.6.3";
+        const string mac = "62:f9:65:10:2f:68";
+        string previous_switch, previous_inband;
+        bool previous_multi = false, configured = false;
+        unique_ptr<Table> previous_system, previous_state;
+
+        void PostSetUp() override
+        {
+            MuxHybridTest::PostSetUp();
+            ASSERT_EQ(nullptr, gNeighOrch->getConsumerBase(CHASSIS_APP_SYSTEM_NEIGH_TABLE_NAME));
+            Port port;
+            ASSERT_TRUE(gPortsOrch->getPort(VLAN_1000, port));
+            previous_switch = gMySwitchType;
+            previous_multi = gMultiAsicVoq;
+            previous_inband = gPortsOrch->m_inbandPortName;
+            previous_system = std::move(gNeighOrch->m_tableVoqSystemNeighTable);
+            previous_state = std::move(gNeighOrch->m_stateSystemNeighTable);
+            configured = true;
+            port.m_alias = remote;
+            port.m_type = Port::SYSTEM;
+            port.m_system_port_info.type = SAI_SYSTEM_PORT_TYPE_REMOTE;
+            gPortsOrch->setPort(remote, port);
+            gPortsOrch->m_inbandPortName = VLAN_1000;
+            gIntfsOrch->m_syncdIntfses[remote] = gIntfsOrch->m_syncdIntfses.at(VLAN_1000);
+            gIntfsOrch->m_syncdIntfses.at(remote).ref_count = 0;
+            gMySwitchType = "voq";
+            gMultiAsicVoq = true;
+            gNeighOrch->m_tableVoqSystemNeighTable = make_unique<Table>(m_app_db.get(), CHASSIS_APP_SYSTEM_NEIGH_TABLE_NAME);
+            gNeighOrch->m_stateSystemNeighTable = make_unique<Table>(m_app_db.get(), STATE_SYSTEM_NEIGH_TABLE_NAME);
+            gNeighOrch->addExecutor(new Consumer(new SubscriberStateTable(m_app_db.get(),
+                CHASSIS_APP_SYSTEM_NEIGH_TABLE_NAME, TableConsumable::DEFAULT_POP_BATCH_SIZE, 0),
+                gNeighOrch, CHASSIS_APP_SYSTEM_NEIGH_TABLE_NAME));
+        }
+
+        void PreTearDown() override
+        {
+            MuxHybridTest::PreTearDown();
+            if (!configured)
+                return;
+            gNeighOrch->m_consumerMap.erase(CHASSIS_APP_SYSTEM_NEIGH_TABLE_NAME);
+            NeighborContext ctx(NeighborEntry(IpAddress(ip), remote));
+            gNeighOrch->removeNeighbor(ctx);
+            gPortsOrch->m_portList.erase(remote);
+            gIntfsOrch->m_syncdIntfses.erase(remote);
+            gPortsOrch->m_inbandPortName = previous_inband;
+            gMySwitchType = previous_switch;
+            gMultiAsicVoq = previous_multi;
+            gNeighOrch->m_tableVoqSystemNeighTable = std::move(previous_system);
+            gNeighOrch->m_stateSystemNeighTable = std::move(previous_state);
+        }
+
+        string SystemKey() { return remote + gNeighOrch->m_tableVoqSystemNeighTable->getTableNameSeparator() + ip; }
+
+        void SystemEvent(bool add, uint32_t encap = 42)
+        {
+            auto key = SystemKey();
+            vector<FieldValueTuple> fields{{"neigh", mac}, {"encap_index", to_string(encap)}};
+            if (add)
+                gNeighOrch->m_tableVoqSystemNeighTable->set(key, fields);
+            else
+                gNeighOrch->m_tableVoqSystemNeighTable->del(key);
+            auto consumer = gNeighOrch->getConsumerBase(CHASSIS_APP_SYSTEM_NEIGH_TABLE_NAME);
+            consumer->addToSync(KeyOpFieldsValuesTuple(key, add ? SET_COMMAND : DEL_COMMAND, fields));
+            static_cast<Orch*>(gNeighOrch)->doTask();
+        }
     };
 
     class MuxPreflightTest : public MuxHybridTest,
@@ -1397,6 +1548,53 @@ namespace mux_rollback_test
         EXPECT_FALSE(m_MuxOrch->isStandaloneTunnelRouteInstalled(IpAddress("192.168.0.9")));
         EXPECT_EQ(1u, m_MuxCable->nbr_handler_->neighbors_.count(IpAddress("192.168.0.9")));
         ExpectNeighborHardware("192.168.0.9", true);
+    }
+
+    TEST_F(MuxHybridTest, MixedRouteRetainsReadyLabeledNonMuxBackup)
+    {
+        ASSERT_EQ(STANDBY_STATE, m_MuxCable->getState());
+        const string backup = "192.168.6.4";
+        const string prefix = "10.65.0.0/24";
+        const auto initial_rif_refs = RifRefs();
+        NeighborEvent(backup, true, "62:f9:65:10:2f:77");
+        ASSERT_TRUE(m_MuxOrch->getNexthopMuxName(Key(backup)).empty());
+        ASSERT_TRUE(gNeighOrch->isHwConfigured(Key(backup)));
+
+        auto consumer = gRouteOrch->getConsumerBase(APP_ROUTE_TABLE_NAME);
+        vector<FieldValueTuple> fields{{"nexthop", SERVER_IP1 + "," + backup},
+                                       {"ifname", VLAN_1000 + "," + VLAN_1000},
+                                       {"mpls_nh", "na,push100"}};
+        consumer->addToSync(KeyOpFieldsValuesTuple(prefix, SET_COMMAND, fields));
+        static_cast<Orch*>(gRouteOrch)->doTask();
+        ASSERT_EQ(0u, consumer->m_toSync.count(prefix));
+        ASSERT_EQ(2u, gRouteOrch->getSyncdRouteNhgKey(gVirtualRouterId, IpPrefix(prefix)).getSize());
+
+        const NextHopKey labeled("push100+" + backup, VLAN_1000);
+        const auto labeled_oid = gNeighOrch->getLocalNextHopId(labeled);
+        ASSERT_NE(SAI_NULL_OBJECT_ID, labeled_oid);
+        ASSERT_NE(gNeighOrch->getLocalNextHopId(Key(backup)), labeled_oid);
+        EXPECT_FALSE(gNeighOrch->isHwConfigured(labeled));
+        sai_attribute_t attr{};
+        attr.id = SAI_NEXT_HOP_ATTR_TYPE;
+        ASSERT_EQ(SAI_STATUS_SUCCESS, old_sai_next_hop_api->get_next_hop_attribute(labeled_oid, 1, &attr));
+        EXPECT_EQ(SAI_NEXT_HOP_TYPE_MPLS, attr.value.s32);
+
+        const auto nh_refs = gNeighOrch->getNextHopRefCount(labeled);
+        const auto rif_refs = RifRefs();
+        for (int retry = 0; retry < 2; ++retry)
+        {
+            m_MuxCable->updateNeighbor(Key(SERVER_IP1), true);
+            EXPECT_EQ(labeled_oid, RouteNextHop(prefix));
+            EXPECT_EQ(nh_refs, gNeighOrch->getNextHopRefCount(labeled));
+            EXPECT_EQ(rif_refs, RifRefs());
+        }
+
+        consumer->addToSync(KeyOpFieldsValuesTuple(prefix, DEL_COMMAND, {}));
+        static_cast<Orch*>(gRouteOrch)->doTask();
+        ASSERT_EQ(0u, consumer->m_toSync.count(prefix));
+        EXPECT_EQ(SAI_NULL_OBJECT_ID, gNeighOrch->getLocalNextHopId(labeled));
+        NeighborEvent(backup, false);
+        EXPECT_EQ(initial_rif_refs, RifRefs());
     }
 
     TEST_F(MuxHybridTest, AlreadyStandbyWithoutLocalNextHopIsANoop)
@@ -3043,9 +3241,521 @@ namespace mux_rollback_test
             gFgNhgOrch->m_syncdFGRouteTables.erase(gVirtualRouterId);
     }
 
+    TEST_P(MuxFgAdmissionTest, OutstandingCleanupGatesFgAcrossStandbyHandoff)
+    {
+        const string prefix = "10.60.0.0/24";
+        bool blocked = true;
+        int removals = 0;
+        ASSERT_NO_FATAL_FAILURE(HoldOwnedHop(blocked, removals));
+        ConfigureFg(prefix, moving_ip);
+        auto consumer = gRouteOrch->getConsumerBase(APP_ROUTE_TABLE_NAME);
+        consumer->addToSync(KeyOpFieldsValuesTuple(prefix, SET_COMMAND,
+            vector<FieldValueTuple>{{"nexthop", moving_ip}, {"ifname", VLAN_1000}}));
+        auto crm = CrmUsed();
+        ASSERT_TRUE(m_MuxOrch->hasPendingNextHopRecovery(Key(moving_ip)));
+        static_cast<Orch*>(gRouteOrch)->doTask();
+        EXPECT_EQ(1u, consumer->m_toSync.count(prefix));
+        EXPECT_FALSE(gFgNhgOrch->syncdContainsFgNhg(gVirtualRouterId, IpPrefix(prefix)));
+        EXPECT_EQ(0, gNeighOrch->getNextHopRefCount(Key(moving_ip)));
+        EXPECT_EQ(crm, CrmUsed());
+        if (get<0>(GetParam()))
+        {
+            SetFdb(moving_mac, "Ethernet8");
+            ASSERT_FALSE(m_MuxOrch->getMuxCable("Ethernet8")->isStateChangeFailed());
+            EXPECT_TRUE(m_MuxOrch->hasPendingNextHopRecovery(Key(moving_ip)));
+            static_cast<Orch*>(gRouteOrch)->doTask();
+            EXPECT_EQ(1u, consumer->m_toSync.count(prefix));
+        }
+        if (get<1>(GetParam()))
+        {
+            SetMuxStateFromAppDb(ACTIVE_STATE, "Ethernet8");
+            ASSERT_TRUE(m_MuxCable->isStateChangeFailed());
+        }
+        else
+        {
+            blocked = false;
+            ASSERT_NO_FATAL_FAILURE(CompleteRecovery());
+        }
+        ASSERT_FALSE(m_MuxOrch->hasPendingNextHopRecovery(Key(moving_ip)));
+        static_cast<Orch*>(gRouteOrch)->doTask();
+        ASSERT_EQ(0u, consumer->m_toSync.count(prefix));
+        auto target = get<1>(GetParam()) ? gNeighOrch->getLocalNextHopId(Key(moving_ip))
+            : m_MuxOrch->getNextHopTunnelId(MUX_TUNNEL, m_MuxCable->peer_ip4_);
+        ASSERT_NO_FATAL_FAILURE(ExpectFgNextHop(prefix, target));
+        EXPECT_EQ(get<1>(GetParam()) ? 2 : 0, gNeighOrch->getNextHopRefCount(Key(moving_ip)));
+        if (get<1>(GetParam()))
+        {
+            blocked = false;
+            ASSERT_NO_FATAL_FAILURE(CompleteRecovery());
+            EXPECT_EQ(target, gNeighOrch->getLocalNextHopId(Key(moving_ip)));
+        }
+        DeleteRoute(prefix);
+        DeleteRoute("10.40.0.0/24");
+        EXPECT_EQ(0, gNeighOrch->getNextHopRefCount(Key(moving_ip)));
+        NeighborEvent(moving_ip, false);
+    }
+
+    INSTANTIATE_TEST_SUITE_P(ResourceOwners, MuxFgAdmissionTest,
+        testing::Values(make_tuple(false, false), make_tuple(true, false), make_tuple(true, true)));
+
+    TEST_F(MuxAssociationTest, RecoveryQueryDistinguishesConflictRetirementAndUnknown)
+    {
+        bool blocked = true;
+        int removals = 0;
+        ASSERT_NO_FATAL_FAILURE(HoldOwnedHop(blocked, removals));
+        NeighborContext* ctx = nullptr;
+        for (auto& candidate : m_MuxCable->nbr_handler_->neighbor_contexts_)
+            if (candidate.neighborEntry == Key(moving_ip))
+                ctx = &candidate;
+        ASSERT_NE(nullptr, ctx);
+        ASSERT_TRUE(ctx->nexthop_created);
+        EXPECT_FALSE(m_MuxOrch->hasPendingNextHopRecovery(Key(SERVER_IP1)));
+        auto saved = *ctx;
+        ctx->next_hop_id = SAI_NULL_OBJECT_ID;
+        ctx->incarnation = make_shared<NeighborIncarnation>();
+        m_MuxCable->nbr_handler_->transition_.at(IpAddress(moving_ip)).transferred = true;
+        EXPECT_TRUE(m_MuxOrch->hasPendingNextHopRecovery(Key(moving_ip)));
+        *ctx = saved;
+        blocked = false;
+        NeighborEvent(moving_ip, false);
+        ASSERT_TRUE(ctx->incarnation->retired);
+        ctx->nexthop_created = true;
+        EXPECT_FALSE(m_MuxOrch->hasPendingNextHopRecovery(Key(moving_ip)));
+        ctx->result_unknown = true;
+        EXPECT_TRUE(m_MuxOrch->hasPendingNextHopRecovery(Key(moving_ip)));
+        ctx->result_unknown = false;
+        ctx->nexthop_created = false;
+        ASSERT_NO_FATAL_FAILURE(CompleteRecovery());
+    }
+
+    TEST_P(MuxNativeReceiverTest, NativeReceiverRepairsEitherIndependentPartialOutcome)
+    {
+        bool neighbor_present = get<0>(GetParam());
+        bool repair_blocked = get<1>(GetParam());
+        bool cleanup_blocked = true;
+        ASSERT_NO_FATAL_FAILURE(HoldIndependentFailure(neighbor_present, cleanup_blocked, true));
+        const string multipath = "10.64.1.0/24";
+        bool check_multipath = !neighbor_present && repair_blocked;
+        if (check_multipath)
+        {
+            auto routes = gRouteOrch->getConsumerBase(APP_ROUTE_TABLE_NAME);
+            routes->addToSync(KeyOpFieldsValuesTuple(multipath, SET_COMMAND,
+                vector<FieldValueTuple>{{"nexthop", moving_ip + ",192.168.1.2"},
+                    {"ifname", VLAN_1000 + "," + VLAN_1000}}));
+            static_cast<Orch*>(gRouteOrch)->doTask();
+            ASSERT_EQ(0u, routes->m_toSync.count(multipath));
+        }
+        auto original = gNeighOrch->getLocalNextHopId(Key(moving_ip));
+        auto incarnation = gNeighOrch->getNeighborTable().at(Key(moving_ip)).incarnation;
+        int refs = RifRefs();
+        int created = 0;
+        if (neighbor_present)
+        {
+            EXPECT_CALL(*mock_sai_neighbor_api, create_neighbor_entry).Times(0);
+            EXPECT_CALL(*mock_sai_next_hop_api, create_next_hop)
+                .WillRepeatedly([&](sai_object_id_t* oid, sai_object_id_t sw, uint32_t count,
+                                    const sai_attribute_t* attrs) -> sai_status_t {
+                    if (repair_blocked)
+                        return SAI_STATUS_TABLE_FULL;
+                    auto status = old_sai_next_hop_api->create_next_hop(oid, sw, count, attrs);
+                    if (status == SAI_STATUS_SUCCESS)
+                        ++created;
+                    return status;
+                });
+        }
+        else
+        {
+            EXPECT_CALL(*mock_sai_next_hop_api, create_next_hop).Times(0);
+            EXPECT_CALL(*mock_sai_neighbor_api, create_neighbor_entry)
+                .WillRepeatedly([&](const sai_neighbor_entry_t* entry, uint32_t count,
+                                    const sai_attribute_t* attrs) -> sai_status_t {
+                    if (repair_blocked)
+                        return SAI_STATUS_FAILURE;
+                    auto status = old_sai_neighbor_api->create_neighbor_entry(entry, count, attrs);
+                    if (status == SAI_STATUS_SUCCESS)
+                        ++created;
+                    return status;
+                });
+        }
+        SetFdb(moving_mac, "Ethernet8");
+        auto consumer = gNeighOrch->getConsumerBase(APP_NEIGH_TABLE_NAME);
+        string key = VLAN_1000 + ":" + moving_ip;
+        if (repair_blocked)
+        {
+            ASSERT_EQ(1u, consumer->m_toSync.count(key));
+            EXPECT_EQ(m_MuxOrch->getNextHopTunnelId(MUX_TUNNEL, m_MuxCable->peer_ip4_),
+                      RouteNextHop("10.64.0.0/24"));
+            if (neighbor_present)
+            {
+                EXPECT_EQ(0u, gNeighOrch->m_syncdNextHops.count(Key(moving_ip)));
+            }
+            if (check_multipath)
+            {
+                EXPECT_EQ(gNeighOrch->getLocalNextHopId(Key("192.168.1.2")), RouteNextHop(multipath));
+            }
+            EXPECT_FALSE(incarnation->retired);
+            for (const auto& ctx : m_MuxCable->nbr_handler_->neighbor_contexts_)
+            {
+                if (ctx.neighborEntry == Key(moving_ip))
+                {
+                    EXPECT_TRUE(neighbor_present ? ctx.neighbor_created : ctx.nexthop_created);
+                }
+            }
+            EXPECT_TRUE(m_MuxOrch->hasPendingNextHopRecovery(Key(moving_ip)));
+            EXPECT_EQ(refs, RifRefs());
+            static_cast<Orch*>(gNeighOrch)->doTask();
+            EXPECT_EQ(1u, consumer->m_toSync.count(key));
+            EXPECT_EQ(0, created);
+            EXPECT_EQ(m_MuxOrch->getNextHopTunnelId(MUX_TUNNEL, m_MuxCable->peer_ip4_),
+                      RouteNextHop("10.64.0.0/24"));
+            repair_blocked = false;
+            static_cast<Orch*>(gNeighOrch)->doTask();
+        }
+        ASSERT_EQ(0u, consumer->m_toSync.count(key));
+        ASSERT_EQ(1, created);
+        auto local = gNeighOrch->getLocalNextHopId(Key(moving_ip));
+        ASSERT_NE(SAI_NULL_OBJECT_ID, local);
+        if (!neighbor_present)
+        {
+            EXPECT_EQ(original, local);
+        }
+        ExpectNeighborHardware(moving_ip, true);
+        EXPECT_EQ(local, m_MuxOrch->getMuxCable("Ethernet8")->getNextHopId(Key(moving_ip)));
+        EXPECT_EQ(local, RouteNextHop("10.64.0.0/24"));
+        if (check_multipath)
+        {
+            EXPECT_EQ(local, RouteNextHop(multipath));
+        }
+        EXPECT_EQ(refs + 1, RifRefs());
+        auto crm = CrmUsed();
+        cleanup_blocked = false;
+        ASSERT_NO_FATAL_FAILURE(CompleteRecovery());
+        EXPECT_EQ(crm, CrmUsed());
+        EXPECT_EQ(local, gNeighOrch->getLocalNextHopId(Key(moving_ip)));
+    }
+
+    INSTANTIATE_TEST_SUITE_P(IndependentObjects, MuxNativeReceiverTest,
+        testing::Combine(testing::Bool(), testing::Bool()));
+
+    TEST_F(MuxAssociationTest, QueuedReceiverRepairDoesNotReviveStandbyObligation)
+    {
+        bool cleanup_blocked = true;
+        ASSERT_NO_FATAL_FAILURE(HoldIndependentFailure(false, cleanup_blocked));
+        EXPECT_CALL(*mock_sai_neighbor_api, create_neighbor_entry)
+            .WillOnce(Return(SAI_STATUS_FAILURE));
+        SetFdb(moving_mac, "Ethernet8");
+        auto consumer = gNeighOrch->getConsumerBase(APP_NEIGH_TABLE_NAME);
+        string key = VLAN_1000 + ":" + moving_ip;
+        ASSERT_EQ(1u, consumer->m_toSync.count(key));
+        SetMuxStateFromAppDb(STANDBY_STATE, "Ethernet8");
+        ASSERT_EQ(STANDBY_STATE, m_MuxOrch->getMuxCable("Ethernet8")->getState());
+        static_cast<Orch*>(gNeighOrch)->doTask();
+        EXPECT_EQ(0u, consumer->m_toSync.count(key));
+        ExpectNeighborHardware(moving_ip, false);
+        cleanup_blocked = false;
+        ASSERT_NO_FATAL_FAILURE(CompleteRecovery());
+        EXPECT_EQ(SAI_NULL_OBJECT_ID, gNeighOrch->getLocalNextHopId(Key(moving_ip)));
+    }
+
+    TEST_F(MuxAssociationTest, ReceiverRepairNeverReplacesPendingDelete)
+    {
+        bool cleanup_blocked = true;
+        ASSERT_NO_FATAL_FAILURE(HoldIndependentFailure(false, cleanup_blocked));
+        auto consumer = gNeighOrch->getConsumerBase(APP_NEIGH_TABLE_NAME);
+        string key = VLAN_1000 + ":" + moving_ip;
+        consumer->addToSync(KeyOpFieldsValuesTuple(key, DEL_COMMAND, vector<FieldValueTuple>{}));
+        EXPECT_CALL(*mock_sai_neighbor_api, create_neighbor_entry).WillOnce(Return(SAI_STATUS_FAILURE));
+        SetFdb(moving_mac, "Ethernet8");
+        ASSERT_EQ(1u, consumer->m_toSync.count(key));
+        EXPECT_EQ(DEL_COMMAND, kfvOp(consumer->m_toSync.find(key)->second));
+        cleanup_blocked = false;
+        static_cast<Orch*>(gNeighOrch)->doTask();
+        EXPECT_EQ(0u, consumer->m_toSync.count(key));
+        EXPECT_EQ(0u, gNeighOrch->getNeighborTable().count(Key(moving_ip)));
+        ASSERT_NO_FATAL_FAILURE(CompleteRecovery());
+        static_cast<Orch*>(gNeighOrch)->doTask();
+        RecoveryTimerTick();
+        EXPECT_EQ(0u, consumer->m_toSync.count(key));
+        EXPECT_EQ(0u, gNeighOrch->getNeighborTable().count(Key(moving_ip)));
+        EXPECT_EQ(SAI_NULL_OBJECT_ID, gNeighOrch->getLocalNextHopId(Key(moving_ip)));
+        ExpectNeighborHardware(moving_ip, false);
+    }
+
+    TEST_F(MuxAssociationTest, NativeSuccessWithoutObjectCannotCompleteQueuedRepair)
+    {
+        bool cleanup_blocked = true;
+        ASSERT_NO_FATAL_FAILURE(HoldIndependentFailure(true, cleanup_blocked, true));
+        EXPECT_CALL(*mock_sai_next_hop_api, create_next_hop)
+            .WillOnce(Return(SAI_STATUS_ITEM_ALREADY_EXISTS))
+            .WillOnce(Return(SAI_STATUS_ITEM_ALREADY_EXISTS))
+            .WillRepeatedly([](sai_object_id_t* oid, sai_object_id_t sw, uint32_t count,
+                               const sai_attribute_t* attrs) -> sai_status_t {
+                return old_sai_next_hop_api->create_next_hop(oid, sw, count, attrs);
+            });
+        SetFdb(moving_mac, "Ethernet8");
+        auto consumer = gNeighOrch->getConsumerBase(APP_NEIGH_TABLE_NAME);
+        string key = VLAN_1000 + ":" + moving_ip;
+        ASSERT_EQ(1u, consumer->m_toSync.count(key));
+        static_cast<Orch*>(gNeighOrch)->doTask();
+        EXPECT_EQ(1u, consumer->m_toSync.count(key));
+        EXPECT_EQ(SAI_NULL_OBJECT_ID, gNeighOrch->getLocalNextHopId(Key(moving_ip)));
+        EXPECT_EQ(0u, gNeighOrch->m_syncdNextHops.count(Key(moving_ip)));
+        EXPECT_EQ(m_MuxOrch->getNextHopTunnelId(MUX_TUNNEL, m_MuxCable->peer_ip4_),
+                  RouteNextHop("10.64.0.0/24"));
+        EXPECT_TRUE(m_MuxOrch->hasPendingNextHopRecovery(Key(moving_ip)));
+        static_cast<Orch*>(gNeighOrch)->doTask();
+        EXPECT_EQ(0u, consumer->m_toSync.count(key));
+        EXPECT_NE(SAI_NULL_OBJECT_ID, gNeighOrch->getLocalNextHopId(Key(moving_ip)));
+        cleanup_blocked = false;
+        ASSERT_NO_FATAL_FAILURE(CompleteRecovery());
+    }
+
     TEST_F(MuxAssociationTest, ActiveFdbReceiverPermanentlyAdoptsOwnedObjects)
     {
         ASSERT_NO_FATAL_FAILURE(ExerciseTransfer(true, false, false, true));
+    }
+
+    TEST_F(MuxAssociationTest, ReceiverRepairNeverReplacesNewerMacSet)
+    {
+        bool cleanup_blocked = true;
+        ASSERT_NO_FATAL_FAILURE(HoldIndependentFailure(false, cleanup_blocked));
+        const string newer_mac = "62:f9:65:10:2f:69";
+        SetFdb(newer_mac, "Ethernet8");
+        auto incarnation = gNeighOrch->getNeighborTable().at(Key(moving_ip)).incarnation;
+        auto consumer = gNeighOrch->getConsumerBase(APP_NEIGH_TABLE_NAME);
+        string key = VLAN_1000 + ":" + moving_ip;
+        consumer->addToSync(KeyOpFieldsValuesTuple(key, SET_COMMAND,
+            vector<FieldValueTuple>{{"neigh", newer_mac}, {"family", "IPv4"}}));
+        bool blocked = true;
+        EXPECT_CALL(*mock_sai_next_hop_api, create_next_hop).Times(0);
+        EXPECT_CALL(*mock_sai_neighbor_api, create_neighbor_entry)
+            .WillRepeatedly([&](const sai_neighbor_entry_t* entry, uint32_t count,
+                                const sai_attribute_t* attrs) -> sai_status_t {
+                return blocked ? SAI_STATUS_FAILURE : old_sai_neighbor_api->create_neighbor_entry(entry, count, attrs);
+            });
+        SetFdb(moving_mac, "Ethernet8");
+        ASSERT_EQ(1u, consumer->m_toSync.count(key));
+        const auto& fields = kfvFieldsValues(consumer->m_toSync.find(key)->second);
+        EXPECT_NE(fields.end(), find(fields.begin(), fields.end(), FieldValueTuple("neigh", newer_mac)));
+        auto original = gNeighOrch->getLocalNextHopId(Key(moving_ip));
+        blocked = false;
+        static_cast<Orch*>(gNeighOrch)->doTask();
+        EXPECT_EQ(0u, consumer->m_toSync.count(key));
+        EXPECT_EQ(MacAddress(newer_mac), gNeighOrch->getNeighborTable().at(Key(moving_ip)).mac);
+        EXPECT_TRUE(incarnation->retired);
+        EXPECT_NE(incarnation, gNeighOrch->getNeighborTable().at(Key(moving_ip)).incarnation);
+        EXPECT_EQ(original, gNeighOrch->getLocalNextHopId(Key(moving_ip)));
+        cleanup_blocked = false;
+        ASSERT_NO_FATAL_FAILURE(CompleteRecovery());
+        ExpectNeighborHardware(moving_ip, true);
+        auto entry = SaiNeighbor(moving_ip);
+        sai_attribute_t attr{};
+        attr.id = SAI_NEIGHBOR_ENTRY_ATTR_DST_MAC_ADDRESS;
+        ASSERT_EQ(SAI_STATUS_SUCCESS, old_sai_neighbor_api->get_neighbor_entry_attribute(&entry, 1, &attr));
+        EXPECT_EQ(MacAddress(newer_mac), MacAddress(attr.value.mac));
+    }
+
+    TEST_F(MuxAssociationTest, ReceiverRepairPreservesPendingDeleteThenSetSequence)
+    {
+        bool cleanup_blocked = true;
+        ASSERT_NO_FATAL_FAILURE(HoldIndependentFailure(false, cleanup_blocked));
+        const string newer_mac = "62:f9:65:10:2f:69";
+        SetFdb(newer_mac, "Ethernet8");
+        auto consumer = gNeighOrch->getConsumerBase(APP_NEIGH_TABLE_NAME);
+        string key = VLAN_1000 + ":" + moving_ip;
+        vector<KeyOpFieldsValuesTuple> expected{
+            KeyOpFieldsValuesTuple(key, DEL_COMMAND, vector<FieldValueTuple>{}),
+            KeyOpFieldsValuesTuple(key, SET_COMMAND,
+                vector<FieldValueTuple>{{"neigh", newer_mac}, {"family", "IPv4"}})
+        };
+        for (const auto& update : expected)
+            consumer->addToSync(update);
+        bool blocked = true;
+        EXPECT_CALL(*mock_sai_next_hop_api, create_next_hop).Times(0);
+        EXPECT_CALL(*mock_sai_neighbor_api, create_neighbor_entry)
+            .WillRepeatedly([&](const sai_neighbor_entry_t* entry, uint32_t count,
+                                const sai_attribute_t* attrs) -> sai_status_t {
+                return blocked ? SAI_STATUS_FAILURE : old_sai_neighbor_api->create_neighbor_entry(entry, count, attrs);
+            });
+        auto incarnation = gNeighOrch->getNeighborTable().at(Key(moving_ip)).incarnation;
+        auto original = gNeighOrch->getLocalNextHopId(Key(moving_ip));
+        SetFdb(moving_mac, "Ethernet8");
+        vector<KeyOpFieldsValuesTuple> queued;
+        auto range = consumer->m_toSync.equal_range(key);
+        for (auto it = range.first; it != range.second; ++it)
+            queued.push_back(it->second);
+        EXPECT_EQ(expected, queued);
+        EXPECT_CALL(*mock_sai_next_hop_api, remove_next_hop(original))
+            .WillOnce(Return(SAI_STATUS_FAILURE));
+        blocked = false;
+        static_cast<Orch*>(gNeighOrch)->doTask();
+        ASSERT_EQ(0u, consumer->m_toSync.count(key));
+        EXPECT_TRUE(incarnation->retired);
+        EXPECT_NE(incarnation, gNeighOrch->getNeighborTable().at(Key(moving_ip)).incarnation);
+        EXPECT_EQ(original, gNeighOrch->getLocalNextHopId(Key(moving_ip)));
+        EXPECT_EQ(MacAddress(newer_mac), gNeighOrch->getNeighborTable().at(Key(moving_ip)).mac);
+        auto entry = SaiNeighbor(moving_ip);
+        sai_attribute_t attr{};
+        attr.id = SAI_NEIGHBOR_ENTRY_ATTR_DST_MAC_ADDRESS;
+        ASSERT_EQ(SAI_STATUS_SUCCESS, old_sai_neighbor_api->get_neighbor_entry_attribute(&entry, 1, &attr));
+        EXPECT_EQ(MacAddress(newer_mac), MacAddress(attr.value.mac));
+        cleanup_blocked = false;
+        ASSERT_NO_FATAL_FAILURE(CompleteRecovery());
+        static_cast<Orch*>(gNeighOrch)->doTask();
+        EXPECT_EQ(0u, consumer->m_toSync.count(key));
+        ExpectNeighborHardware(moving_ip, true);
+    }
+
+    TEST_P(MuxVoqSystemTest, SystemConsumerRepairsCanonicalNextHopBeforeCompletingSet)
+    {
+        bool fail_next_create = false;
+        int calls = 0, creates = 0;
+        EXPECT_CALL(*mock_sai_next_hop_api, create_next_hop)
+            .WillRepeatedly([&](sai_object_id_t* oid, sai_object_id_t sw, uint32_t count,
+                                const sai_attribute_t* attrs) -> sai_status_t {
+                ++calls;
+                if (fail_next_create)
+                {
+                    fail_next_create = false;
+                    return SAI_STATUS_TABLE_FULL;
+                }
+                auto status = old_sai_next_hop_api->create_next_hop(oid, sw, count, attrs);
+                if (status == SAI_STATUS_SUCCESS)
+                    ++creates;
+                return status;
+            });
+        auto baseline = CrmUsed();
+        int inband_refs = RifRefs();
+        SystemEvent(true);
+        auto consumer = gNeighOrch->getConsumerBase(CHASSIS_APP_SYSTEM_NEIGH_TABLE_NAME);
+        ASSERT_EQ(0u, consumer->m_toSync.count(SystemKey()));
+        NeighborEntry neighbor(IpAddress(ip), remote);
+        ASSERT_EQ(42u, gNeighOrch->getNeighborTable().at(neighbor).voq_encap_index);
+        auto programmed = CrmUsed();
+        bool block_delete = true;
+        EXPECT_CALL(*mock_sai_neighbor_api, remove_neighbor_entry)
+            .WillRepeatedly([&](const sai_neighbor_entry_t* entry) -> sai_status_t {
+                return block_delete ? SAI_STATUS_FAILURE : old_sai_neighbor_api->remove_neighbor_entry(entry);
+            });
+        SystemEvent(false);
+        ASSERT_EQ(1u, consumer->m_toSync.count(SystemKey()));
+        ASSERT_EQ(SAI_NULL_OBJECT_ID, gNeighOrch->getLocalNextHopId(Key(ip)));
+        ASSERT_TRUE(gNeighOrch->isHwConfigured(neighbor));
+        EXPECT_EQ(1, gIntfsOrch->m_syncdIntfses.at(remote).ref_count);
+        uint32_t encap = GetParam() ? 43 : 42;
+        fail_next_create = true;
+        SystemEvent(true, encap);
+        EXPECT_EQ(2u, consumer->m_toSync.count(SystemKey()));
+        EXPECT_EQ(SAI_NULL_OBJECT_ID, gNeighOrch->getLocalNextHopId(Key(ip)));
+        EXPECT_EQ(1, creates);
+        static_cast<Orch*>(gNeighOrch)->doTask();
+        ASSERT_EQ(0u, consumer->m_toSync.count(SystemKey()));
+        EXPECT_EQ(3, calls);
+        EXPECT_EQ(2, creates);
+        EXPECT_NE(SAI_NULL_OBJECT_ID, gNeighOrch->getLocalNextHopId(Key(ip)));
+        EXPECT_EQ(SAI_NULL_OBJECT_ID, gNeighOrch->getLocalNextHopId(neighbor));
+        EXPECT_EQ(encap, gNeighOrch->getNeighborTable().at(neighbor).voq_encap_index);
+        EXPECT_EQ(2, gIntfsOrch->m_syncdIntfses.at(remote).ref_count);
+        EXPECT_EQ(inband_refs, RifRefs());
+        EXPECT_EQ(programmed, CrmUsed());
+        block_delete = false;
+        SystemEvent(false);
+        EXPECT_EQ(0u, consumer->m_toSync.count(SystemKey()));
+        EXPECT_EQ(baseline, CrmUsed());
+    }
+
+    INSTANTIATE_TEST_SUITE_P(SystemEncapsulation, MuxVoqSystemTest, testing::Bool());
+
+    TEST_P(MuxPrefixMacTest, IncomingMacRoleChangeKeepsPrefixFailureRetryable)
+    {
+        const string ip = "192.168.2.4";
+        const string old_mac = "62:f9:65:10:2f:70";
+        const string new_mac = "62:f9:65:10:2f:71";
+        SetMuxStateFromAppDb(GetParam() ? ACTIVE_STATE : STANDBY_STATE);
+        SetMuxStateFromAppDb(GetParam() ? STANDBY_STATE : ACTIVE_STATE, "Ethernet8");
+        SetFdb(old_mac, TEST_INTERFACE);
+        SetFdb(new_mac, "Ethernet8");
+        NeighborEvent(ip, true, old_mac);
+        ASSERT_EQ(TEST_INTERFACE, m_MuxOrch->getNexthopMuxName(Key(ip)));
+        auto old_target = RouteNextHop(ip);
+        auto local = gNeighOrch->getLocalNextHopId(Key(ip));
+        auto target = GetParam() ? m_MuxOrch->getNextHopTunnelId(MUX_TUNNEL, m_MuxCable->peer_ip4_) : local;
+        ASSERT_NE(old_target, target);
+        bool blocked = true;
+        route_set = [&, target](const sai_route_entry_t* entry, const sai_attribute_t* attr) -> sai_status_t {
+            if (sai_serialize_ip_prefix(entry->destination) == ip + "/32" &&
+                attr->id == SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID && attr->value.oid == target && blocked)
+                return SAI_STATUS_FAILURE;
+            return old_sai_route_api->set_route_entry_attribute(entry, attr);
+        };
+        EXPECT_CALL(*mock_sai_route_api, create_route_entry).Times(0);
+        EXPECT_CALL(*mock_sai_next_hop_api, create_next_hop).Times(0);
+        auto crm = CrmUsed();
+        int refs = RifRefs();
+        auto consumer = gNeighOrch->getConsumerBase(APP_NEIGH_TABLE_NAME);
+        string key = VLAN_1000 + ":" + ip;
+        consumer->addToSync(KeyOpFieldsValuesTuple(key, SET_COMMAND,
+            vector<FieldValueTuple>{{"neigh", new_mac}, {"family", "IPv4"}}));
+        static_cast<Orch*>(gNeighOrch)->doTask();
+        ASSERT_EQ(1u, consumer->m_toSync.count(key));
+        EXPECT_EQ(old_target, RouteNextHop(ip));
+        EXPECT_EQ(TEST_INTERFACE, m_MuxOrch->getNexthopMuxName(Key(ip)));
+        EXPECT_TRUE(gNeighOrch->getNeighborTable().at(Key(ip)).incarnation->prefix_pending);
+        EXPECT_TRUE(gNeighOrch->getNeighborTable().at(Key(ip)).incarnation->prefix_owned);
+        EXPECT_TRUE(m_MuxOrch->hasPendingNextHopRecovery(Key(ip)));
+        static_cast<Orch*>(gNeighOrch)->doTask();
+        EXPECT_EQ(1u, consumer->m_toSync.count(key));
+        EXPECT_EQ(old_target, RouteNextHop(ip));
+        blocked = false;
+        static_cast<Orch*>(gNeighOrch)->doTask();
+        ASSERT_EQ(0u, consumer->m_toSync.count(key));
+        EXPECT_EQ("Ethernet8", m_MuxOrch->getNexthopMuxName(Key(ip)));
+        EXPECT_EQ(target, RouteNextHop(ip));
+        EXPECT_FALSE(gNeighOrch->getNeighborTable().at(Key(ip)).incarnation->prefix_pending);
+        EXPECT_EQ(local, gNeighOrch->getLocalNextHopId(Key(ip)));
+        EXPECT_EQ(crm, CrmUsed());
+        EXPECT_EQ(refs, RifRefs());
+        NeighborEvent(ip, false);
+    }
+
+    INSTANTIATE_TEST_SUITE_P(MacRoleDirections, MuxPrefixMacTest, testing::Bool());
+
+    TEST_F(MuxPrefixRecoveryTest, InitPrefixBootstrapDoesNotRequireTunnel)
+    {
+        const string ip = "192.168.0.3";
+        auto old_state = m_MuxCable->state_;
+        auto tunnels = m_MuxOrch->mux_tunnel_nh_;
+        bool restored = false;
+        auto restore = shared_ptr<void>(nullptr, [&](void*) {
+            if (!restored)
+            {
+                m_MuxCable->state_ = old_state;
+                m_MuxOrch->mux_tunnel_nh_ = tunnels;
+                m_MuxOrch->updateCachedNeighbors();
+                m_MuxOrch->disableCachingNeighborUpdate();
+            }
+        });
+        m_MuxCable->state_ = MuxState::MUX_STATE_INIT;
+        m_MuxOrch->mux_tunnel_nh_.clear();
+        m_MuxOrch->enableCachingNeighborUpdate();
+        NeighborEvent(ip);
+        ASSERT_FALSE(gNeighOrch->getNeighborTable().at(Key(ip)).incarnation->prefix_pending);
+        auto local = gNeighOrch->getLocalNextHopId(Key(ip));
+        ASSERT_NE(SAI_NULL_OBJECT_ID, local);
+        EXPECT_EQ(local, RouteNextHop(ip));
+        auto route = SaiRoute(ip);
+        sai_attribute_t attr{};
+        attr.id = SAI_ROUTE_ENTRY_ATTR_PACKET_ACTION;
+        ASSERT_EQ(SAI_STATUS_SUCCESS, old_sai_route_api->get_route_entry_attribute(&route, 1, &attr));
+        EXPECT_EQ(SAI_PACKET_ACTION_DROP, attr.value.s32);
+        m_MuxCable->state_ = old_state;
+        m_MuxOrch->mux_tunnel_nh_ = tunnels;
+        m_MuxOrch->updateCachedNeighbors();
+        m_MuxOrch->disableCachingNeighborUpdate();
+        restored = true;
+        EXPECT_EQ(m_MuxOrch->getNextHopTunnelId(MUX_TUNNEL, m_MuxCable->peer_ip4_), RouteNextHop(ip));
+        ASSERT_TRUE(m_MuxCable->nbr_handler_->prepareStateChange(true));
+        m_MuxCable->nbr_handler_->commitStateChange();
     }
 
     TEST_F(MuxAssociationTest, FdbAbaCannotReviveReleasedCleanupOwnership)

@@ -1085,9 +1085,12 @@ void NeighOrch::doTask(Consumer &consumer)
             ctx.mac = mac_address;
 
             bool nbr_not_found = (m_syncdNeighbors.find(neighbor_entry) == m_syncdNeighbors.end());
-            bool repair = !nbr_not_found && m_syncdNeighbors.at(neighbor_entry).hw_configured &&
-                          (getLocalNextHopId(getLocalNextHopKey(neighbor_entry)) == SAI_NULL_OBJECT_ID ||
-                           m_syncdNeighbors.at(neighbor_entry).incarnation->prefix_pending);
+            bool repair = !nbr_not_found &&
+                          ((m_syncdNeighbors.at(neighbor_entry).hw_configured &&
+                            getLocalNextHopId(getLocalNextHopKey(neighbor_entry)) == SAI_NULL_OBJECT_ID) ||
+                           m_syncdNeighbors.at(neighbor_entry).prefix_route ||
+                           m_syncdNeighbors.at(neighbor_entry).incarnation->prefix_pending ||
+                           needsActiveMuxNeighborRepair(neighbor_entry, mac_address));
             if (nbr_not_found || m_syncdNeighbors[neighbor_entry].mac != mac_address || repair)
             {
                 if (!mac_address)
@@ -1115,7 +1118,9 @@ void NeighOrch::doTask(Consumer &consumer)
                         it = consumer.m_toSync.erase(it);
                     }
                 }
-                else if (addNeighbor(ctx))
+                else if (addNeighbor(ctx) && !needsActiveMuxNeighborRepair(neighbor_entry, mac_address) &&
+                         (m_syncdNeighbors.find(neighbor_entry) == m_syncdNeighbors.end() ||
+                          !m_syncdNeighbors.at(neighbor_entry).incarnation->prefix_pending))
                 {
                     it = consumer.m_toSync.erase(it);
                 }
@@ -1221,26 +1226,35 @@ bool NeighOrch::addPrefixRouteForNeighbor(const IpAddress& ip_address, string& a
     sai_attribute_t rt_attr;
     vector<sai_attribute_t> rt_attrs;
 
-    // neighbors in mux standby state has DROP action
-    rt_attr.id = SAI_ROUTE_ENTRY_ATTR_PACKET_ACTION;
-    if (is_active)
+    auto data = m_syncdNeighbors.find(NeighborEntry(ip_address, alias));
+    auto cable = data == m_syncdNeighbors.end() ? nullptr
+        : mux_orch->findMuxCableForNeighbor(data->first, data->second.mac);
+    bool forward = cable ? cable->isActive() : is_active;
+    if (cable && !cable->isActive())
     {
-        rt_attr.value.s32 = SAI_PACKET_ACTION_FORWARD;
+        if (cable->getState() == "standby")
+        {
+            next_hop_id = mux_orch->getTunnelNextHopId();
+            forward = true;
+        }
+        else
+        {
+            // INIT may not have a tunnel yet. Preserve its local/DROP bootstrap.
+            forward = false;
+        }
     }
-    else
-    {
-        rt_attr.value.s32 = SAI_PACKET_ACTION_DROP;
-    }
-
-    rt_attrs.push_back(rt_attr);
+    if (next_hop_id == SAI_NULL_OBJECT_ID)
+        return false;
 
     rt_attr.id = SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID;
     rt_attr.value.oid = next_hop_id;
     rt_attrs.push_back(rt_attr);
+    rt_attr.id = SAI_ROUTE_ENTRY_ATTR_PACKET_ACTION;
+    rt_attr.value.s32 = forward ? SAI_PACKET_ACTION_FORWARD : SAI_PACKET_ACTION_DROP;
+    rt_attrs.push_back(rt_attr);
 
     // if standalone mux route for this neighbor is created, then
     // set the new attributes
-    auto data = m_syncdNeighbors.find(NeighborEntry(ip_address, alias));
     if (mux_orch->isStandaloneTunnelRouteInstalled(ip_address) ||
         (data != m_syncdNeighbors.end() && data->second.incarnation->prefix_owned))
     {
@@ -1551,7 +1565,7 @@ bool NeighOrch::addNeighbor(NeighborContext& ctx)
             gCrmOrch->incCrmResUsedCounter(CrmResourceType::CRM_IPV6_NEIGHBOR);
         }
 
-        if (!addNextHop(ctx))
+        if (getLocalNextHopId(local_key) == SAI_NULL_OBJECT_ID && !addNextHop(ctx))
         {
             status = sai_neighbor_api->remove_neighbor_entry(&neighbor_entry);
             if (status != SAI_STATUS_SUCCESS)
@@ -1604,10 +1618,7 @@ bool NeighOrch::addNeighbor(NeighborContext& ctx)
     setNeighborData(neighborEntry, macAddress, hw_config, prefix_route,
                     !bulk_op && (previous_hw_config != hw_config ||
                                  previous_next_hop != getLocalNextHopId(local_key)));
-    if (hw_config && prefix_route &&
-        (!m_syncdNeighbors.at(neighborEntry).incarnation->prefix_owned ||
-         m_syncdNeighbors.at(neighborEntry).incarnation->prefix_pending ||
-         previous_next_hop != getLocalNextHopId(local_key)))
+    if (hw_config && prefix_route)
     {
         auto incarnation = m_syncdNeighbors.at(neighborEntry).incarnation;
         // Preserve primary-object ownership even if its dependent route must be retried.
@@ -1901,6 +1912,18 @@ bool NeighOrch::isHwConfigured(const NeighborEntry& neighborEntry)
     return (m_syncdNeighbors[neighborEntry].hw_configured);
 }
 
+bool NeighOrch::needsActiveMuxNeighborRepair(const NeighborEntry& entry, const MacAddress& mac)
+{
+    auto neighbor = m_syncdNeighbors.find(entry);
+    auto mux = gDirectory.get<MuxOrch*>();
+    if (!mux || neighbor == m_syncdNeighbors.end() || !neighbor->second.mac || !mac)
+        return false;
+    auto cable = mux->findMuxCableForNeighbor(entry, mac);
+    return cable && cable->isActive() &&
+           (!neighbor->second.hw_configured ||
+            getLocalNextHopId(getLocalNextHopKey(entry)) == SAI_NULL_OBJECT_ID);
+}
+
 bool NeighOrch::enableNeighbor(const NeighborEntry& neighborEntry)
 {
     SWSS_LOG_NOTICE("Neighbor enable request for %s ", neighborEntry.ip_address.to_string().c_str());
@@ -1911,7 +1934,9 @@ bool NeighOrch::enableNeighbor(const NeighborEntry& neighborEntry)
         return true;
     }
 
-    if (isHwConfigured(neighborEntry))
+    if (isHwConfigured(neighborEntry) &&
+        getLocalNextHopId(getLocalNextHopKey(neighborEntry)) != SAI_NULL_OBJECT_ID &&
+        !m_syncdNeighbors.at(neighborEntry).incarnation->prefix_pending)
     {
         SWSS_LOG_INFO("Neighbor %s is already programmed to HW", neighborEntry.ip_address.to_string().c_str());
         return true;
@@ -1921,7 +1946,28 @@ bool NeighOrch::enableNeighbor(const NeighborEntry& neighborEntry)
     NeighborContext ctx = NeighborContext(neigh);
     ctx.mac = m_syncdNeighbors[neighborEntry].mac;
 
-    return addNeighbor(ctx);
+    auto mux = gDirectory.get<MuxOrch*>();
+    auto owner = mux ? mux->findMuxCableForNeighbor(neighborEntry, ctx.mac) : nullptr;
+    if (addNeighbor(ctx) && isHwConfigured(neighborEntry) &&
+        getLocalNextHopId(getLocalNextHopKey(neighborEntry)) != SAI_NULL_OBJECT_ID &&
+        !m_syncdNeighbors.at(neighborEntry).incarnation->prefix_pending)
+        return true;
+
+    auto current = m_syncdNeighbors.find(neighborEntry);
+    // FDB notifications cannot retry. Use the normal queue without superseding newer neighbor intent.
+    if (current != m_syncdNeighbors.end() && current->second.mac == ctx.mac && mux &&
+        owner == mux->findMuxCableForNeighbor(neighborEntry, current->second.mac) &&
+        (needsActiveMuxNeighborRepair(neighborEntry, current->second.mac) ||
+         current->second.incarnation->prefix_pending))
+    {
+        auto consumer = getConsumerBase(APP_NEIGH_TABLE_NAME);
+        auto key = neighborEntry.alias + ":" + neighborEntry.ip_address.to_string();
+        if (consumer && !consumer->m_toSync.count(key))
+            consumer->addToSync(KeyOpFieldsValuesTuple(key, SET_COMMAND,
+                vector<FieldValueTuple>{{"neigh", current->second.mac.to_string()},
+                    {"family", neighborEntry.ip_address.isV4() ? "IPv4" : "IPv6"}}));
+    }
+    return false;
 }
 
 bool NeighOrch::disableNeighbor(const NeighborEntry& neighborEntry)
@@ -2372,9 +2418,11 @@ void NeighOrch::doVoqSystemNeighTask(Consumer &consumer)
                 }
             }
 
+            bool repair = m_syncdNeighbors.find(neighbor_entry) != m_syncdNeighbors.end() &&
+                          getLocalNextHopId(getLocalNextHopKey(neighbor_entry)) == SAI_NULL_OBJECT_ID;
             if (m_syncdNeighbors.find(neighbor_entry) == m_syncdNeighbors.end() ||
                     m_syncdNeighbors[neighbor_entry].mac != mac_address ||
-                    m_syncdNeighbors[neighbor_entry].voq_encap_index != encap_index)
+                    m_syncdNeighbors[neighbor_entry].voq_encap_index != encap_index || repair)
             {
 
                 if (m_syncdNeighbors.find(neighbor_entry) != m_syncdNeighbors.end() &&
@@ -2402,8 +2450,9 @@ void NeighOrch::doVoqSystemNeighTask(Consumer &consumer)
                             SWSS_LOG_ERROR("Failed to remove voq neighbor %s from SAI during encap index update", kfvKey(t).c_str());
                         }
                         it++;
+                        continue;
                     }
-                    else
+                    else if (!repair)
                     {
                         SWSS_LOG_NOTICE("VOQ encap index updated for neighbor %s", kfvKey(t).c_str());
                         it = consumer.m_toSync.erase(it);
@@ -2418,14 +2467,15 @@ void NeighOrch::doVoqSystemNeighTask(Consumer &consumer)
                            consumer.m_toSync.erase(next(rit).base());
                            SWSS_LOG_NOTICE("Removed pending system neighbor DEL operation for %s after SET operation", key.c_str());
                        }
+                       continue;
                     }
-                    continue;
                 }
 
                 //Add neigh to SAI
                 NeighborContext ctx = NeighborContext(neighbor_entry);
                 ctx.mac = mac_address;
-                if (addNeighbor(ctx))
+                if (addNeighbor(ctx) && isHwConfigured(neighbor_entry) &&
+                    getLocalNextHopId(getLocalNextHopKey(neighbor_entry)) != SAI_NULL_OBJECT_ID)
                 {
                     //neigh successfully added to SAI. Set STATE DB to signal kernel programming by neighbor manager
 
